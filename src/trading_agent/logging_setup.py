@@ -43,4 +43,8 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> Path:
     file_handler.setFormatter(JsonFormatter())
     root.addHandler(file_handler)
 
+    # httpx logs every request at INFO; keep only its warnings and errors.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     return log_file

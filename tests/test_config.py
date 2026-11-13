@@ -31,6 +31,27 @@ def test_bad_risk_limit_is_rejected(project_root, bad):
         load_settings(project_root)
 
 
+def test_watchlist_and_data_defaults(project_root):
+    s = load_settings(project_root)
+    assert s.data_feed == "iex"
+    assert s.watchlist[0] == "SPY" and len(s.watchlist) == len(set(s.watchlist))
+
+
+@pytest.mark.parametrize(
+    "override, match",
+    [
+        ('[broker]\npaper_base_url = "https://api.alpaca.markets"\n', "paper"),
+        ('[data]\nfeed = "otc"\n', "feed"),
+        ('[watchlist]\nsymbols = []\n', "non-empty"),
+        ('[watchlist]\nsymbols = ["AAPL", "not a ticker"]\n', "Invalid symbol"),
+    ],
+)
+def test_bad_broker_and_data_settings_rejected(project_root, override, match):
+    (project_root / "config" / "settings.local.toml").write_text(override)
+    with pytest.raises(ConfigError, match=match):
+        load_settings(project_root)
+
+
 def test_missing_settings_file(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_settings(tmp_path)

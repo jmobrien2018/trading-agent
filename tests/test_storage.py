@@ -35,6 +35,23 @@ def test_audit_log_is_append_only(conn):
     assert storage.recent_events(conn)[0]["payload"] == {"qty": 1}
 
 
+def test_bars_upsert_is_idempotent_and_queryable(conn):
+    from datetime import datetime, timedelta, timezone
+
+    from trading_agent.models import Bar
+
+    t0 = datetime(2026, 11, 10, 14, 30, tzinfo=timezone.utc)
+    bars = [Bar("AAPL", "1Min", t0 + timedelta(minutes=i), 1, 2, 0.5, 1.5, 100) for i in range(3)]
+    assert storage.upsert_bars(conn, bars, "iex") == 3
+    storage.upsert_bars(conn, bars, "iex")  # same window again: no duplicates
+    storage.upsert_bars(conn, bars[:1], "sip")  # other feed kept separately
+
+    times = storage.bar_times(conn, "AAPL", "1Min", "iex", t0, t0 + timedelta(minutes=2))
+    assert times == [t0, t0 + timedelta(minutes=1)]  # end is exclusive
+    assert conn.execute("SELECT COUNT(*) FROM bars").fetchone()[0] == 4
+    assert storage.stored_feeds(conn, "1Min") == ["iex", "sip"]
+
+
 def test_reconnect_keeps_schema_and_data(tmp_path):
     db = tmp_path / "db.sqlite3"
     c1 = storage.connect(db)

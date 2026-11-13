@@ -7,8 +7,9 @@ The project plan, decisions log and go-live gate live in the "Trading Agent — 
 
 ## Status
 
-Phase 0 (foundations) is scaffolded: settings, secrets handling, local storage, logging and a CLI.
-Nothing talks to a broker yet. Alpaca integration starts in Phase 1.
+Phase 0 (foundations) is done: settings, secrets handling, local storage, logging and a CLI.
+Phase 1 data pull is built: read-only Alpaca client, bar storage and data-quality report.
+No orders can be placed; that waits for the risk engine (Phase 4).
 
 ## Setup (Windows, PowerShell)
 
@@ -37,6 +38,23 @@ also works as a fallback, but the keychain is preferred.
 
 Broker keys should be paper-only, with 2FA on the Alpaca account.
 
+## Phase 1: pull data and check its quality
+
+Once the paper keys are stored:
+
+```powershell
+trading-agent broker account                     # keys work? account status (read-only, no orders)
+trading-agent data pull                          # last 7 days of 1-minute bars, watchlist, IEX feed
+trading-agent data pull --feed sip               # same window from all exchanges (free plan: >15 min old)
+trading-agent data report                        # coverage, longest gap, worst day per symbol and feed
+trading-agent data pull --timeframe 1Day --days 365
+trading-agent data report --timeframe 1Day --days 365
+```
+
+Pulling both feeds and running `data report` shows how thin the free IEX feed is next to
+the full market (SIP). Run `data pull` during market hours to see how fresh the newest bar is.
+The watchlist and default feed live in `config/settings.toml`.
+
 ## Layout
 
 | Path | What it holds |
@@ -45,7 +63,9 @@ Broker keys should be paper-only, with 2FA on the Alpaca account.
 | `config/settings.local.toml` | Optional, git-ignored machine overrides |
 | `src/trading_agent/config.py` | Loads and validates settings; rejects any mode but `paper` |
 | `src/trading_agent/credentials.py` | Reads keys from env or keychain; `Secret` masks values in output |
-| `src/trading_agent/storage.py` | SQLite database; append-only audit log |
+| `src/trading_agent/storage.py` | SQLite database: append-only audit log, price bars |
+| `src/trading_agent/alpaca.py` | Paper-only Alpaca REST client: account, clock, calendar, bars |
+| `src/trading_agent/data_quality.py` | Coverage, gap and freshness checks for stored bars |
 | `src/trading_agent/logging_setup.py` | Console logs plus JSON-lines file in `logs/` |
 | `src/trading_agent/cli.py` | `trading-agent check` and `trading-agent secrets ...` |
 | `data/`, `logs/` | Local database and logs (git-ignored) |

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_SYMBOL_RE = re.compile(r"[A-Z][A-Z0-9.]{0,9}")
 
 # Live trading is deliberately not an accepted mode until the go-live gate (Phase 8).
 ALLOWED_MODES = frozenset({"paper"})
+PAPER_TRADING_HOST = "paper-api.alpaca.markets"
+DATA_FEEDS = frozenset({"iex", "sip"})
+ADJUSTMENTS = frozenset({"raw", "split", "dividend", "all"})
 
 
 class ConfigError(Exception):
@@ -34,6 +40,10 @@ class Settings:
     db_file: Path
     broker_name: str
     broker_base_url: str
+    data_base_url: str
+    data_feed: str
+    data_adjustment: str
+    watchlist: tuple[str, ...]
     risk: RiskLimits
 
 
@@ -96,6 +106,17 @@ def load_settings(root: Path | None = None) -> Settings:
         max_trades_per_day=_positive("max_trades_per_day", _require(raw, "risk", "max_trades_per_day"), int),
     )
 
+    broker_base_url = _require(raw, "broker", "paper_base_url")
+    if urlparse(broker_base_url).hostname != PAPER_TRADING_HOST:
+        raise ConfigError(f"[broker] paper_base_url must point at {PAPER_TRADING_HOST}, got {broker_base_url!r}")
+
+    feed = _require(raw, "data", "feed")
+    if feed not in DATA_FEEDS:
+        raise ConfigError(f"[data] feed must be one of {sorted(DATA_FEEDS)}, got {feed!r}")
+    adjustment = _require(raw, "data", "adjustment")
+    if adjustment not in ADJUSTMENTS:
+        raise ConfigError(f"[data] adjustment must be one of {sorted(ADJUSTMENTS)}, got {adjustment!r}")
+
     return Settings(
         root=root,
         mode=mode,
@@ -103,6 +124,24 @@ def load_settings(root: Path | None = None) -> Settings:
         log_dir=resolve(_require(raw, "paths", "log_dir")),
         db_file=resolve(_require(raw, "paths", "db_file")),
         broker_name=_require(raw, "broker", "name"),
-        broker_base_url=_require(raw, "broker", "paper_base_url"),
+        broker_base_url=broker_base_url,
+        data_base_url=_require(raw, "broker", "data_base_url"),
+        data_feed=feed,
+        data_adjustment=adjustment,
+        watchlist=parse_symbols(_require(raw, "watchlist", "symbols")),
         risk=risk,
     )
+
+
+def parse_symbols(value: Any) -> tuple[str, ...]:
+    """Validate and normalise a list of ticker symbols (uppercase, de-duplicated, order kept)."""
+    if isinstance(value, str) or not isinstance(value, (list, tuple)) or not value:
+        raise ConfigError(f"Symbols must be a non-empty list, got {value!r}")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _SYMBOL_RE.fullmatch(item.strip().upper()):
+            raise ConfigError(f"Invalid symbol {item!r}")
+        sym = item.strip().upper()
+        if sym not in out:
+            out.append(sym)
+    return tuple(out)

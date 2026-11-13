@@ -1,4 +1,4 @@
-"""Local SQLite storage. Phase 0 holds the audit log; market data tables arrive in Phase 2.
+"""Local SQLite storage: the audit log and price bars.
 
 The audit log is append-only: triggers reject UPDATE and DELETE so the record of every
 signal, proposal, decision and order can't be rewritten after the fact.
@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+from .models import Bar
+
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -39,7 +42,32 @@ BEFORE DELETE ON audit_log
 BEGIN
     SELECT RAISE(ABORT, 'audit_log is append-only');
 END;
+
+-- Price bars. ts_utc = bar start, 'YYYY-MM-DDTHH:MM:SSZ' so text order = time order.
+-- Re-pulling the same window overwrites (adjusted prices can change after splits).
+CREATE TABLE IF NOT EXISTS bars (
+    symbol      TEXT    NOT NULL,
+    timeframe   TEXT    NOT NULL,
+    feed        TEXT    NOT NULL,
+    ts_utc      TEXT    NOT NULL,
+    open        REAL    NOT NULL,
+    high        REAL    NOT NULL,
+    low         REAL    NOT NULL,
+    close       REAL    NOT NULL,
+    volume      INTEGER NOT NULL,
+    trade_count INTEGER,
+    vwap        REAL,
+    PRIMARY KEY (symbol, timeframe, feed, ts_utc)
+) WITHOUT ROWID;
 """
+
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _ts(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        raise ValueError("timestamps must be timezone-aware")
+    return dt.astimezone(timezone.utc).strftime(_TS_FMT)
 
 
 def connect(db_file: Path) -> sqlite3.Connection:
@@ -52,10 +80,43 @@ def connect(db_file: Path) -> sqlite3.Connection:
     with conn:
         conn.executescript(_SCHEMA)
         conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
     return conn
+
+
+def upsert_bars(conn: sqlite3.Connection, bars: Iterable[Bar], feed: str) -> int:
+    """Insert or replace bars; returns how many rows were written."""
+    rows = [
+        (b.symbol, b.timeframe, feed, _ts(b.ts_utc), b.open, b.high, b.low, b.close, b.volume, b.trade_count, b.vwap)
+        for b in bars
+    ]
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO bars "
+            "(symbol, timeframe, feed, ts_utc, open, high, low, close, volume, trade_count, vwap) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    return len(rows)
+
+
+def bar_times(
+    conn: sqlite3.Connection, symbol: str, timeframe: str, feed: str, start: datetime, end: datetime
+) -> list[datetime]:
+    """Start times of stored bars in [start, end), ascending."""
+    rows = conn.execute(
+        "SELECT ts_utc FROM bars WHERE symbol = ? AND timeframe = ? AND feed = ? AND ts_utc >= ? AND ts_utc < ? "
+        "ORDER BY ts_utc",
+        (symbol, timeframe, feed, _ts(start), _ts(end)),
+    ).fetchall()
+    return [datetime.strptime(r[0], _TS_FMT).replace(tzinfo=timezone.utc) for r in rows]
+
+
+def stored_feeds(conn: sqlite3.Connection, timeframe: str) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT DISTINCT feed FROM bars WHERE timeframe = ? ORDER BY feed", (timeframe,))]
 
 
 def record_event(conn: sqlite3.Connection, kind: str, payload: dict[str, Any] | None = None) -> int:

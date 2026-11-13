@@ -15,6 +15,19 @@ db_file = "data/trading_agent.sqlite3"
 [broker]
 name = "alpaca"
 paper_base_url = "https://paper-api.alpaca.markets"
+data_base_url = "https://data.alpaca.markets"
+
+[data]
+# "iex" = free real-time feed, IEX exchange only (thinner: only IEX trades make bars).
+# "sip" = all US exchanges; on the free plan only data older than 15 minutes.
+feed = "iex"
+# Price adjustment for historical bars: raw | split | dividend | all
+adjustment = "split"
+
+[watchlist]
+# Phase 1 test watchlist for data-quality checks: index ETFs plus liquid large caps.
+symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "AMD"]
+# symbols = ["SPY", "QQQ", "SCHD", "SPMO", "DGRO", "VTV"]
 
 [risk]
 # Placeholders. Enforced in code from Phase 4 (risk engine).
