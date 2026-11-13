@@ -1,0 +1,24 @@
+# Non-secret settings. Safe to commit.
+# Secrets (API keys) live in the OS keychain; see README.
+# Put machine-specific overrides in config/settings.local.toml (git-ignored).
+
+[app]
+# Only "paper" is accepted until the Phase 8 go-live gate is passed.
+mode = "paper"
+
+[paths]
+# Relative paths resolve against the project root.
+data_dir = "data"
+log_dir = "logs"
+db_file = "data/trading_agent.sqlite3"
+
+[broker]
+name = "alpaca"
+paper_base_url = "https://paper-api.alpaca.markets"
+
+[risk]
+# Placeholders. Enforced in code from Phase 4 (risk engine).
+max_position_usd = 1000
+max_daily_loss_usd = 200
+max_open_positions = 5
+max_trades_per_day = 10
