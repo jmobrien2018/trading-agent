@@ -1,4 +1,4 @@
-"""Command line: `check`, `secrets ...`, `broker account`, `data pull`, `data report`."""
+"""Command line: `check`, `secrets ...`, `broker account`, and `data pull|report|refresh|latest|status`."""
 
 from __future__ import annotations
 
@@ -6,22 +6,18 @@ import argparse
 import getpass
 import logging
 import sys
-from collections import defaultdict
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from . import __version__, alpaca, credentials, data_quality, storage
+from . import __version__, alpaca, credentials, data_quality, pipeline, storage
 from .config import PROJECT_ROOT, ConfigError, Settings, load_settings, parse_symbols
 from .logging_setup import setup_logging
 from .models import TIMEFRAMES
+from .pipeline import pull_window
 
 log = logging.getLogger("trading_agent")
-
-# Free plan: SIP data from the last 15 minutes is off limits; stay a minute clear of the edge.
-SIP_DELAY = timedelta(minutes=16)
-UPSERT_BATCH = 5_000
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -159,15 +155,6 @@ def _cmd_broker_account(args: argparse.Namespace) -> int:
     return 0
 
 
-def pull_window(now: datetime, days: int, feed: str) -> tuple[datetime, datetime]:
-    """Start at New York midnight `days` days ago, so every session in the window is pulled whole
-    and lines up with `data report --days N`. End now (SIP: 16 minutes ago, the free-plan limit)."""
-    today = now.astimezone(data_quality.NEW_YORK).date()
-    start = datetime.combine(today - timedelta(days=days), dtime(0), data_quality.NEW_YORK)
-    end = now - SIP_DELAY if feed == "sip" else now
-    return start.astimezone(timezone.utc), end
-
-
 def _cmd_data_pull(args: argparse.Namespace) -> int:
     settings = _load(args)
     if settings is None:
@@ -185,22 +172,13 @@ def _cmd_data_pull(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc)
     start, end = pull_window(now, args.days, feed)
 
-    counts: dict[str, int] = defaultdict(int)
-    newest: dict[str, datetime] = {}
     conn = storage.connect(settings.db_file)
     try:
         with client:
             is_open = bool(client.get_clock().get("is_open"))
-            batch = []
-            for bar in client.get_bars(symbols, args.timeframe, start, end, feed=feed, adjustment=settings.data_adjustment):
-                batch.append(bar)
-                counts[bar.symbol] += 1
-                if bar.symbol not in newest or bar.ts_utc > newest[bar.symbol]:
-                    newest[bar.symbol] = bar.ts_utc
-                if len(batch) >= UPSERT_BATCH:
-                    storage.upsert_bars(conn, batch, feed)
-                    batch.clear()
-            storage.upsert_bars(conn, batch, feed)
+            counts, newest = pipeline.ingest(
+                client, conn, symbols, args.timeframe, start, end, feed=feed, adjustment=settings.data_adjustment
+            )
         total = sum(counts.values())
         storage.record_event(conn, "data_pull", {
             "feed": feed, "timeframe": args.timeframe, "start": start.isoformat(), "end": end.isoformat(),
@@ -294,6 +272,137 @@ def _cmd_data_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data_refresh(args: argparse.Namespace) -> int:
+    settings = _load(args)
+    if settings is None:
+        return 2
+    with pipeline.refresh_lock(settings.data_dir / "refresh.lock") as acquired:
+        if not acquired:
+            log.info("refresh skipped: another refresh is running")
+            print("Another refresh is already running; skipped.")
+            return 0
+        client = _client(settings)
+        if client is None:
+            return 2
+        conn = storage.connect(settings.db_file)
+        try:
+            with client:
+                result = pipeline.refresh(client, conn, settings)
+            if result.total_bars or result.snapshots or result.warnings or result.checked_session:
+                storage.record_event(conn, "data_refresh", {
+                    "feed": settings.data_feed, "market_open": result.market_open, "written": result.written,
+                    "backfilled": result.backfilled, "snapshots": result.snapshots,
+                    "checked_session": result.checked_session, "warnings": result.warnings,
+                })
+        except alpaca.AlpacaError as e:
+            log.error("refresh failed: %s", e)
+            print(e, file=sys.stderr)
+            return 1
+        except Exception:
+            # Scheduled runs have no console; make sure the traceback reaches the log file.
+            log.exception("refresh crashed")
+            raise
+        finally:
+            conn.close()
+
+    print(f"Refresh done ({settings.data_feed.upper()} feed). Market is {'OPEN' if result.market_open else 'closed'}.")
+    for tf, counts in result.written.items():
+        new = result.backfilled.get(tf, [])
+        note = f"  (backfilled {', '.join(new)})" if new else ""
+        print(f"  {tf:<5} {sum(counts.values()):>9,} bars written for {len(counts)} symbol(s){note}")
+    if result.market_open:
+        print(f"  quotes {result.snapshots:>8} snapshots saved")
+    if result.checked_session:
+        print(f"  quality check of {result.checked_session}: "
+              f"{'see warnings below' if result.warnings else 'all symbols above minimum coverage'}")
+    if result.warnings:
+        print("\nWarnings:")
+        for w in result.warnings:
+            print(f"  - {w}")
+    return 0
+
+
+def _cmd_data_latest(args: argparse.Namespace) -> int:
+    settings = _load(args)
+    if settings is None:
+        return 2
+    try:
+        symbols = _symbols(args, settings)
+    except ConfigError as e:
+        print(e, file=sys.stderr)
+        return 2
+    client = _client(settings)
+    if client is None:
+        return 2
+    conn = storage.connect(settings.db_file)
+    try:
+        with client:
+            is_open = bool(client.get_clock().get("is_open"))
+            snaps = client.get_snapshots(symbols, feed=settings.data_feed)
+        storage.insert_snapshots(conn, snaps, settings.data_feed)
+    except alpaca.AlpacaError as e:
+        print(e, file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    now = datetime.now(timezone.utc)
+    print(f"Latest quotes ({settings.data_feed.upper()} feed). Market is {'OPEN' if is_open else 'closed'}.")
+    if settings.data_feed == "iex":
+        print("IEX bid/ask is IEX's own book, not the national best, so spreads can look wider.")
+    print(f"\n  {'SYMBOL':<7} {'LAST':>10} {'CHG':>7} {'BID':>10} {'ASK':>10} {'SPREAD':>9} {'QUOTE AGE':>10}")
+    by_symbol = {s.symbol: s for s in snaps}
+    for sym in symbols:
+        s = by_symbol.get(sym)
+        if s is None:
+            print(f"  {sym:<7} {'no data':>10}")
+            continue
+        chg = f"{(s.last_price / s.prev_close - 1):+.2%}" if s.last_price and s.prev_close else "-"
+        spread = f"{s.spread_bps:.1f} bp" if s.spread_bps is not None else "-"
+        print(f"  {sym:<7} {_fmt_px(s.last_price):>10} {chg:>7} {_fmt_px(s.bid):>10} {_fmt_px(s.ask):>10} "
+              f"{spread:>9} {_fmt_age(data_quality.age_minutes(s.quote_ts_utc, now)):>10}")
+    return 0
+
+
+def _cmd_data_status(args: argparse.Namespace) -> int:
+    settings = _load(args)
+    if settings is None:
+        return 2
+    conn = storage.connect(settings.db_file)
+    try:
+        inventory = storage.bar_inventory(conn)
+        last_refresh = storage.recent_events(conn, "data_refresh", limit=1)
+    finally:
+        conn.close()
+
+    now = datetime.now(timezone.utc)
+    if last_refresh:
+        ts = datetime.fromisoformat(last_refresh[0]["ts_utc"])
+        print(f"Last refresh with new data: {ts:%Y-%m-%d %H:%M} UTC ({_fmt_age(data_quality.age_minutes(ts, now))} ago)")
+    else:
+        print("No refresh has run yet. Run: trading-agent data refresh")
+    if (settings.data_dir / "refresh.lock").exists():
+        print("A refresh is running right now.")
+    if not inventory:
+        print("No bars stored yet.")
+        return 0
+
+    watch = set(settings.watchlist)
+    print(f"\n  {'FEED':<4} {'TF':<5} {'SYMBOL':<7} {'BARS':>9}  {'FIRST':<16} {'LAST':<16} {'AGE':>8}")
+    for row in inventory:
+        fmt = "%Y-%m-%d" if row["timeframe"] == "1Day" else "%Y-%m-%d %H:%M"
+        mark = "" if row["symbol"] in watch else "  (not on watchlist)"
+        print(f"  {row['feed']:<4} {row['timeframe']:<5} {row['symbol']:<7} {row['bars']:>9,}  "
+              f"{row['first'].strftime(fmt):<16} {row['last'].strftime(fmt):<16} "
+              f"{_fmt_age(data_quality.age_minutes(row['last'], now)):>8}{mark}")
+    print("\nTimes are UTC. Daily bars are stamped at midnight New York time.")
+    return 0
+
+
+def _fmt_px(value: float | None) -> str:
+    return "-" if value is None else f"{value:,.2f}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trading-agent")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -340,6 +449,18 @@ def build_parser() -> argparse.ArgumentParser:
     d_rep.add_argument("--feed", choices=["iex", "sip"], default=None, help="default: every feed stored")
     d_rep.add_argument("--symbols", nargs="+", default=None)
     d_rep.set_defaults(func=_cmd_data_report)
+
+    d_ref = data_sub.add_parser(
+        "refresh", help="backfill new symbols, fetch new bars, save quotes, check quality (run on a schedule)"
+    )
+    d_ref.set_defaults(func=_cmd_data_refresh)
+
+    d_lat = data_sub.add_parser("latest", help="latest quote and trade per symbol (also saved)")
+    d_lat.add_argument("--symbols", nargs="+", default=None)
+    d_lat.set_defaults(func=_cmd_data_latest)
+
+    d_stat = data_sub.add_parser("status", help="what is stored per symbol and how fresh it is (no API calls)")
+    d_stat.set_defaults(func=_cmd_data_status)
 
     return parser
 

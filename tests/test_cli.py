@@ -128,6 +128,46 @@ def test_session_at_window_edge_is_pulled_whole(project_root, fake_api, capsys):
     assert "390/390" in out and "100.0%" in out and "0 min" in out
 
 
+def test_refresh_status_and_latest(project_root, fake_api, capsys):
+    root = ["--root", str(project_root)]
+    (project_root / "config" / "settings.local.toml").write_text('[watchlist]\nsymbols = ["AAPL"]\n')
+
+    assert main([*root, "data", "status"]) == 0
+    assert "No refresh has run yet" in capsys.readouterr().out
+
+    assert main([*root, "data", "refresh"]) == 0
+    out = capsys.readouterr().out
+    assert "1,167 bars written" in out and "backfilled AAPL" in out  # fixture skips 3 minutes on one day
+    assert "quality check of" in out and "all symbols above minimum coverage" in out  # 99.2% on that day
+    assert not (project_root / "data" / "refresh.lock").exists()
+
+    assert main([*root, "data", "refresh"]) == 0  # second run: incremental, nothing new to check
+    out = capsys.readouterr().out
+    assert "backfilled" not in out and "quality check" not in out
+
+    assert main([*root, "data", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "Last refresh with new data" in out and "iex  1Min  AAPL" in out
+
+    fake_api.is_open = True
+    fake_api.snapshots["AAPL"] = {
+        "latestQuote": {"t": "2026-11-13T18:59:58Z", "bp": 200.0, "ap": 200.04},
+        "latestTrade": {"t": "2026-11-13T18:59:59Z", "p": 200.02},
+        "prevDailyBar": {"c": 198.0},
+    }
+    assert main([*root, "data", "latest"]) == 0
+    out = capsys.readouterr().out
+    assert "200.02" in out and "+1.02%" in out and "2.0 bp" in out
+
+
+def test_refresh_skips_when_locked(project_root, fake_api, capsys):
+    (project_root / "data").mkdir()
+    (project_root / "data" / "refresh.lock").write_text("999")
+    assert main(["--root", str(project_root), "data", "refresh"]) == 0
+    assert "already running" in capsys.readouterr().out
+    assert fake_api.requests == []
+
+
 def test_data_pull_without_keys_explains(project_root, capsys):
     assert main(["--root", str(project_root), "data", "pull"]) == 2
     assert "trading-agent secrets set ALPACA_PAPER_API_KEY" in capsys.readouterr().err

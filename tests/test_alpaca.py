@@ -83,6 +83,26 @@ def test_bars_follow_pagination_across_symbols():
     assert q["feed"] == "iex" and q["timeframe"] == "1Min" and q["start"] == "2026-11-10T00:00:00Z"
 
 
+def test_snapshots_parsed_and_empty_symbols_skipped():
+    fake = FakeAlpaca()
+    fake.snapshots = {
+        "SPY": {
+            "latestQuote": {"t": "2026-11-13T18:59:58.123456789Z", "bp": 500.0, "ap": 500.1, "bs": 3, "as": 5},
+            "latestTrade": {"t": "2026-11-13T18:59:59Z", "p": 500.05, "s": 100},
+            "prevDailyBar": {"c": 495.0},
+        },
+        "THIN": {"latestTrade": {"t": "2026-11-13T15:00:00Z", "p": 10.0}},  # no quote
+    }
+    with make_client(fake) as c:
+        snaps = c.get_snapshots(["SPY", "THIN", "NODATA"])
+    spy, thin = snaps
+    assert spy.quote_ts_utc == utc(2026, 11, 13, 18, 59, 58, 123456)
+    assert (spy.bid, spy.ask, spy.last_price, spy.prev_close) == (500.0, 500.1, 500.05, 495.0)
+    assert spy.spread_bps == pytest.approx(2.0, abs=0.01)
+    assert thin.quote_ts_utc == utc(2026, 11, 13, 15) and thin.bid is None and thin.spread_bps is None
+    assert fake.requests[0].url.params["feed"] == "iex"
+
+
 def test_bars_reject_naive_timestamps():
     from datetime import datetime
 

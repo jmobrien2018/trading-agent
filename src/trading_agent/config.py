@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .models import TIMEFRAMES
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SYMBOL_RE = re.compile(r"[A-Z][A-Z0-9.]{0,9}")
 
@@ -44,6 +46,11 @@ class Settings:
     data_feed: str
     data_adjustment: str
     watchlist: tuple[str, ...]
+    history_daily_years: int
+    history_minute_days: int
+    refresh_timeframes: tuple[str, ...]
+    min_coverage: float
+    stale_minutes: int
     risk: RiskLimits
 
 
@@ -64,13 +71,13 @@ def _require(raw: dict[str, Any], section: str, key: str) -> Any:
         raise ConfigError(f"Missing setting [{section}] {key}") from None
 
 
-def _positive(name: str, value: Any, kind: type) -> Any:
+def _positive(name: str, value: Any, kind: type, section: str = "risk") -> Any:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigError(f"[risk] {name} must be a number, got {value!r}")
+        raise ConfigError(f"[{section}] {name} must be a number, got {value!r}")
     if value <= 0:
-        raise ConfigError(f"[risk] {name} must be greater than 0, got {value!r}")
+        raise ConfigError(f"[{section}] {name} must be greater than 0, got {value!r}")
     if kind is int and value != int(value):
-        raise ConfigError(f"[risk] {name} must be a whole number, got {value!r}")
+        raise ConfigError(f"[{section}] {name} must be a whole number, got {value!r}")
     return kind(value)
 
 
@@ -117,6 +124,18 @@ def load_settings(root: Path | None = None) -> Settings:
     if adjustment not in ADJUSTMENTS:
         raise ConfigError(f"[data] adjustment must be one of {sorted(ADJUSTMENTS)}, got {adjustment!r}")
 
+    timeframes = _require(raw, "refresh", "timeframes")
+    if (
+        isinstance(timeframes, str)
+        or not isinstance(timeframes, list)
+        or not timeframes
+        or any(tf not in TIMEFRAMES for tf in timeframes)
+    ):
+        raise ConfigError(f"[refresh] timeframes must be a non-empty list from {list(TIMEFRAMES)}, got {timeframes!r}")
+    min_coverage = _positive("min_coverage", _require(raw, "refresh", "min_coverage"), float, "refresh")
+    if min_coverage > 1:
+        raise ConfigError(f"[refresh] min_coverage is a fraction from 0 to 1, got {min_coverage!r}")
+
     return Settings(
         root=root,
         mode=mode,
@@ -129,6 +148,11 @@ def load_settings(root: Path | None = None) -> Settings:
         data_feed=feed,
         data_adjustment=adjustment,
         watchlist=parse_symbols(_require(raw, "watchlist", "symbols")),
+        history_daily_years=_positive("daily_years", _require(raw, "history", "daily_years"), int, "history"),
+        history_minute_days=_positive("minute_days", _require(raw, "history", "minute_days"), int, "history"),
+        refresh_timeframes=tuple(dict.fromkeys(timeframes)),
+        min_coverage=min_coverage,
+        stale_minutes=_positive("stale_minutes", _require(raw, "refresh", "stale_minutes"), int, "refresh"),
         risk=risk,
     )
 

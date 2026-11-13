@@ -15,7 +15,9 @@ DATA = "https://data.alpaca.markets"
 class FakeAlpaca:
     def __init__(self) -> None:
         self.calendar: list[dict] = []
-        self.bars: dict[str, list[dict]] = {}  # symbol -> rows in Alpaca's JSON shape
+        self.bars: dict[str, list[dict]] = {}  # symbol -> 1Min rows in Alpaca's JSON shape
+        self.daily: dict[str, list[dict]] = {}  # symbol -> 1Day rows
+        self.snapshots: dict[str, dict] = {}  # symbol -> snapshot JSON
         self.page_size = 10_000
         self.fail_next: list[int] = []  # status codes to return before succeeding
         self.is_open = False
@@ -28,6 +30,17 @@ class FakeAlpaca:
                 continue
             t = start + timedelta(minutes=i)
             rows.append({"t": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100, "n": 3, "vw": 1.2})
+
+    def add_days(self, symbol: str, days: list[datetime]) -> None:
+        rows = self.daily.setdefault(symbol, [])
+        for d in days:
+            rows.append({"t": d.strftime("%Y-%m-%dT%H:%M:%SZ"), "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 1000})
+
+    def bar_requests(self, timeframe: str) -> list[dict[str, str]]:
+        return [
+            dict(r.url.params) for r in self.requests
+            if r.url.path == "/v2/stocks/bars" and r.url.params.get("timeframe") == timeframe
+        ]
 
     @property
     def transport(self) -> httpx.MockTransport:
@@ -51,14 +64,17 @@ class FakeAlpaca:
             return httpx.Response(200, json=[c for c in self.calendar if q["start"] <= c["date"] <= q["end"]])
         if path == "/v2/stocks/bars":
             return self._bars(q)
+        if path == "/v2/stocks/snapshots":
+            return httpx.Response(200, json={s: self.snapshots[s] for s in q["symbols"].split(",") if s in self.snapshots})
         return httpx.Response(404, json={"message": "not found"})
 
     def _bars(self, q: dict[str, str]) -> httpx.Response:
         start, end = q["start"], q["end"]
+        source = {"1Min": self.bars, "1Day": self.daily}.get(q["timeframe"], {})
         flat = [
             (sym, row)
             for sym in q["symbols"].split(",")
-            for row in self.bars.get(sym, [])
+            for row in source.get(sym, [])
             if start <= row["t"] < end
         ]
         offset = int(q.get("page_token", 0))

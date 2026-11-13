@@ -13,9 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import Bar
+from .models import Bar, Snapshot
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -59,9 +59,26 @@ CREATE TABLE IF NOT EXISTS bars (
     vwap        REAL,
     PRIMARY KEY (symbol, timeframe, feed, ts_utc)
 ) WITHOUT ROWID;
+
+-- Latest quote/trade snapshots, saved while the market is open. One row per new quote.
+CREATE TABLE IF NOT EXISTS quotes (
+    symbol         TEXT NOT NULL,
+    feed           TEXT NOT NULL,
+    quote_ts_utc   TEXT NOT NULL,
+    bid            REAL,
+    ask            REAL,
+    bid_size       INTEGER,
+    ask_size       INTEGER,
+    last_price     REAL,
+    last_trade_utc TEXT,
+    prev_close     REAL,
+    fetched_utc    TEXT NOT NULL,
+    PRIMARY KEY (symbol, feed, quote_ts_utc)
+) WITHOUT ROWID;
 """
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+_TS_FMT_US = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def _ts(dt: datetime) -> str:
@@ -70,10 +87,28 @@ def _ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime(_TS_FMT)
 
 
+def _ts_us(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        raise ValueError("timestamps must be timezone-aware")
+    return dt.astimezone(timezone.utc).strftime(_TS_FMT_US)
+
+
+def _parse(text: str) -> datetime:
+    return datetime.strptime(text, _TS_FMT).replace(tzinfo=timezone.utc)
+
+
+# Public names for other modules storing timestamps in the same text format.
+format_ts = _ts
+parse_ts = _parse
+
+
 def connect(db_file: Path) -> sqlite3.Connection:
     """Open (creating if needed) the database and apply the schema."""
     db_file.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_file)
+    # Generous timeout: a scheduled refresh and a manual command may touch the database at once.
+    conn = sqlite3.connect(db_file, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -112,11 +147,61 @@ def bar_times(
         "ORDER BY ts_utc",
         (symbol, timeframe, feed, _ts(start), _ts(end)),
     ).fetchall()
-    return [datetime.strptime(r[0], _TS_FMT).replace(tzinfo=timezone.utc) for r in rows]
+    return [_parse(r[0]) for r in rows]
 
 
 def stored_feeds(conn: sqlite3.Connection, timeframe: str) -> list[str]:
     return [r[0] for r in conn.execute("SELECT DISTINCT feed FROM bars WHERE timeframe = ? ORDER BY feed", (timeframe,))]
+
+
+def latest_bar_time(conn: sqlite3.Connection, symbol: str, timeframe: str, feed: str) -> datetime | None:
+    row = conn.execute(
+        "SELECT MAX(ts_utc) FROM bars WHERE symbol = ? AND timeframe = ? AND feed = ?", (symbol, timeframe, feed)
+    ).fetchone()
+    return _parse(row[0]) if row and row[0] else None
+
+
+def bar_inventory(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Bar count and first/last bar time per feed, timeframe and symbol."""
+    rows = conn.execute(
+        "SELECT feed, timeframe, symbol, COUNT(*) AS n, MIN(ts_utc) AS first, MAX(ts_utc) AS last "
+        "FROM bars GROUP BY feed, timeframe, symbol ORDER BY feed, timeframe, symbol"
+    ).fetchall()
+    return [
+        {"feed": r["feed"], "timeframe": r["timeframe"], "symbol": r["symbol"], "bars": r["n"],
+         "first": _parse(r["first"]), "last": _parse(r["last"])}
+        for r in rows
+    ]
+
+
+def insert_snapshots(conn: sqlite3.Connection, snapshots: Iterable[Snapshot], feed: str) -> int:
+    """Save snapshots; one already stored for the same quote time is overwritten."""
+    fetched = _ts_us(datetime.now(timezone.utc))
+    rows = [
+        (s.symbol, feed, _ts_us(s.quote_ts_utc), s.bid, s.ask, s.bid_size, s.ask_size, s.last_price,
+         _ts_us(s.last_trade_utc), s.prev_close, fetched)
+        for s in snapshots
+    ]
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO quotes (symbol, feed, quote_ts_utc, bid, ask, bid_size, ask_size, "
+            "last_price, last_trade_utc, prev_close, fetched_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    return len(rows)
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
 
 def record_event(conn: sqlite3.Connection, kind: str, payload: dict[str, Any] | None = None) -> int:

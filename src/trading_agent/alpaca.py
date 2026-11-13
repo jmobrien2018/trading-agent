@@ -7,6 +7,7 @@ No order methods exist yet; orders arrive in Phase 6, behind the risk engine (Ph
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import date, datetime, time as dtime, timezone
@@ -18,12 +19,13 @@ import httpx
 
 from .config import PAPER_TRADING_HOST, Settings
 from .credentials import Secret, get_secret
-from .models import TIMEFRAMES, Bar, Session
+from .models import TIMEFRAMES, Bar, Session, Snapshot
 
 log = logging.getLogger(__name__)
 
 NEW_YORK = ZoneInfo("America/New_York")
 MAX_PAGE_SIZE = 10_000
+_EXTRA_DIGITS = re.compile(r"(\.\d{6})\d+")
 
 
 class AlpacaError(Exception):
@@ -34,6 +36,19 @@ def _utc_iso(ts: datetime) -> str:
     if ts.tzinfo is None:
         raise ValueError("timestamps must be timezone-aware")
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    # Alpaca sends up to nanoseconds ("...:05.123456789Z"); Python keeps microseconds.
+    text = _EXTRA_DIGITS.sub(r"\1", value.replace("Z", "+00:00"))
+    ts = datetime.fromisoformat(text)
+    return (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _num(value: Any, kind: type) -> Any:
+    return None if value is None else kind(value)
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -164,7 +179,7 @@ class AlpacaClient:
                     yield Bar(
                         symbol=symbol,
                         timeframe=timeframe,
-                        ts_utc=datetime.fromisoformat(r["t"].replace("Z", "+00:00")).astimezone(timezone.utc),
+                        ts_utc=_parse_ts(r["t"]),
                         open=float(r["o"]),
                         high=float(r["h"]),
                         low=float(r["l"]),
@@ -177,6 +192,36 @@ class AlpacaClient:
             if not token:
                 return
             params["page_token"] = token
+
+    def get_snapshots(self, symbols: Sequence[str], *, feed: str = "iex") -> list[Snapshot]:
+        """Latest quote, trade and previous close per symbol. Symbols with no data are skipped."""
+        if not symbols:
+            return []
+        body = self._get(self._data, "/v2/stocks/snapshots", {"symbols": ",".join(symbols), "feed": feed})
+        body = body.get("snapshots", body)  # tolerate either response shape
+        out = []
+        for symbol in symbols:
+            snap = body.get(symbol) or {}
+            quote = snap.get("latestQuote") or {}
+            trade = snap.get("latestTrade") or {}
+            prev = snap.get("prevDailyBar") or {}
+            quote_ts = _parse_ts(quote.get("t")) or _parse_ts(trade.get("t"))
+            if quote_ts is None:
+                continue
+            out.append(
+                Snapshot(
+                    symbol=symbol,
+                    quote_ts_utc=quote_ts,
+                    bid=_num(quote.get("bp"), float),
+                    ask=_num(quote.get("ap"), float),
+                    bid_size=_num(quote.get("bs"), int),
+                    ask_size=_num(quote.get("as"), int),
+                    last_price=_num(trade.get("p"), float),
+                    last_trade_utc=_parse_ts(trade.get("t")),
+                    prev_close=_num(prev.get("c"), float),
+                )
+            )
+        return out
 
 
 def client_from_settings(settings: Settings, **kwargs: Any) -> AlpacaClient:

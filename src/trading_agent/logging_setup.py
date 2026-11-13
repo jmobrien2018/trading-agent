@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -35,9 +36,11 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> Path:
         root.removeHandler(handler)
         handler.close()
 
-    console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S"))
-    root.addHandler(console)
+    # Scheduled runs use pythonw.exe, which has no console (sys.stderr is None).
+    if sys.stderr is not None:
+        console = logging.StreamHandler()
+        console.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S"))
+        root.addHandler(console)
 
     file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(JsonFormatter())

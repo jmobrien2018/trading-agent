@@ -44,6 +44,9 @@ def test_watchlist_and_data_defaults(project_root):
         ('[data]\nfeed = "otc"\n', "feed"),
         ('[watchlist]\nsymbols = []\n', "non-empty"),
         ('[watchlist]\nsymbols = ["AAPL", "not a ticker"]\n', "Invalid symbol"),
+        ('[refresh]\ntimeframes = ["1Week"]\n', "timeframes"),
+        ('[refresh]\nmin_coverage = 95\n', "fraction"),
+        ('[history]\nminute_days = 0\n', "minute_days"),
     ],
 )
 def test_bad_broker_and_data_settings_rejected(project_root, override, match):

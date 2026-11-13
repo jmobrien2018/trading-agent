@@ -24,6 +24,19 @@ feed = "iex"
 # Price adjustment for historical bars: raw | split | dividend | all
 adjustment = "split"
 
+[history]
+# How far back `data refresh` backfills a symbol the first time it sees it.
+daily_years = 5      # daily bars, for swing strategies and longer backtests
+minute_days = 90     # 1-minute bars, for day strategies (~60 sessions)
+
+[refresh]
+# What `data refresh` keeps up to date. After the first backfill it only fetches new bars.
+timeframes = ["1Min", "1Day"]
+# Warn when a completed session's 1-minute coverage (regular hours) falls below this.
+min_coverage = 0.95
+# While the market is open, warn when a symbol's newest 1-minute bar is older than this.
+stale_minutes = 15
+
 [watchlist]
 # Phase 1 test watchlist for data-quality checks: index ETFs plus liquid large caps.
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "AMD"]
