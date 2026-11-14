@@ -97,6 +97,19 @@ trading-agent backtest run --strategy trend_ma --period holdout   # final check 
 - Every run and trade is saved to the database. Hold-out runs are counted, so it's visible how often the unseen
   year has been used.
 
+### Day strategies (1-minute bars)
+
+```powershell
+# one-time: 10 years of full-market minute bars, regular hours only (~3 million bars, a few minutes)
+trading-agent data pull --feed sip --timeframe 1Min --days 3650 --regular-hours --symbols SPY QQQ TQQQ
+trading-agent data spreads                               # measure real bid/ask spreads from sampled quotes
+trading-agent backtest run --strategy intraday_momentum  # runs at each cost in [backtest] intraday_costs_bp
+```
+
+- Day strategies set `timeframe = "1Min"` and are flat every night (`flat_by_minute`).
+- Each symbol trades an equal, fixed slice of the capital. The output shows each symbol's result under the total.
+- Orders fill at the next minute's open. Stops and targets are checked against each minute's high and low.
+
 ## Ad hoc pulls and reports (Phase 1)
 
 ```powershell

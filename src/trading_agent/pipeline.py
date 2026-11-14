@@ -55,6 +55,15 @@ class RefreshResult:
         return sum(sum(v.values()) for v in self.written.values())
 
 
+REGULAR_OPEN, REGULAR_CLOSE = dtime(9, 30), dtime(16, 0)
+
+
+def is_regular_hours(ts_utc: datetime) -> bool:
+    """Bar starts between 9:30 and 16:00 New York time (half-day closes are handled by the calendar)."""
+    t = ts_utc.astimezone(NEW_YORK).time()
+    return REGULAR_OPEN <= t < REGULAR_CLOSE
+
+
 def ny_midnight_utc(day: date) -> datetime:
     return datetime.combine(day, dtime(0), NEW_YORK).astimezone(timezone.utc)
 
@@ -92,12 +101,17 @@ def ingest(
     *,
     feed: str,
     adjustment: str,
+    regular_hours_only: bool = False,
 ) -> tuple[dict[str, int], dict[str, datetime]]:
-    """Fetch bars and store them in batches. Returns (bars per symbol, newest bar per symbol)."""
+    """Fetch bars and store them in batches. Returns (bars per symbol, newest bar per symbol).
+    `regular_hours_only` keeps intraday bars starting 9:30-15:59 New York time (saves space
+    for long minute-bar histories; pre- and post-market bars are dropped)."""
     counts: dict[str, int] = defaultdict(int)
     newest: dict[str, datetime] = {}
     batch = []
     for bar in client.get_bars(symbols, timeframe, start, end, feed=feed, adjustment=adjustment):
+        if regular_hours_only and not is_regular_hours(bar.ts_utc):
+            continue
         batch.append(bar)
         counts[bar.symbol] += 1
         if bar.symbol not in newest or bar.ts_utc > newest[bar.symbol]:

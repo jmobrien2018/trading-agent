@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import logging
 import math
 import sys
@@ -183,6 +184,7 @@ def _cmd_data_pull(args: argparse.Namespace) -> int:
             counts, newest = pipeline.ingest(
                 client, conn, symbols, args.timeframe, start, end, feed=feed,
                 adjustment=pipeline.adjustment_for(args.timeframe, settings),
+                regular_hours_only=args.regular_hours,
             )
         total = sum(counts.values())
         storage.record_event(conn, "data_pull", {
@@ -439,6 +441,8 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
     try:
         feed = settings.daily_feed
         bars = {s: storage.load_daily_bars(conn, s, feed) for s in symbols}
+        if args.strategy != "all" and REGISTRY[args.strategy].timeframe == "1Min":
+            bars = {s: df for s, df in bars.items() if not df.empty}  # daily bars only for benchmarks
         missing = [s for s, df in bars.items() if df.empty]
         if missing:
             print(f"No daily bars ({feed.upper()} feed) for {', '.join(missing)}. Run: trading-agent data refresh",
@@ -457,6 +461,15 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         for name in names:
             cls = REGISTRY[name]
             strat = cls()
+            if cls.timeframe == "1Min":  # day strategies: minute bars, intraday engine
+                ids = _run_intraday(conn, settings, cls, symbols, args.period, batch, bars, spy)
+                if ids is None:
+                    if args.strategy != "all":
+                        return 1
+                    print(f"Skipped {cls.label()} (see above).", file=sys.stderr)
+                    continue
+                run_ids += ids
+                continue
             # Symbols used only as signal sources (e.g. QQQ when trading TQQQ alone).
             sources = {strat.signal_symbol(s, cls.defaults()) for s in symbols} - set(bars)
             signal_bars = {s: storage.load_daily_bars(conn, s, feed) for s in sources}
@@ -538,6 +551,69 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_intraday(conn, settings: Settings, cls, symbols: list[str], period: str, batch: str,
+                  daily_bars: dict, spy) -> list[int] | None:
+    """Backtest a day strategy on stored minute bars; prints its table. None on missing data."""
+    from . import backtest, backtest_intraday
+    from .strategy import no_lookahead
+
+    feed = settings.backtest_minute_feed
+    bars = {}
+    for s in symbols:
+        df = storage.load_minute_bars(conn, s, feed)
+        if df.empty:
+            print(f"No {feed.upper()} minute bars for {s}. Run: trading-agent data pull --feed {feed} "
+                  f"--timeframe 1Min --days 3650 --regular-hours --symbols {' '.join(symbols)}", file=sys.stderr)
+            return None
+        bars[s] = backtest_intraday.prepare(df)
+    strat = cls()
+    holdout = settings.holdout_start
+    for s, df in bars.items():  # refuse to run a strategy that peeks at the future
+        sample = df[df["session"] < holdout].iloc[-200_000:]
+        report = no_lookahead(strat, sample, cls.defaults())
+        if not report.ok:
+            print(f"{cls.label()} looks ahead on {s}: {report.problems[0]}", file=sys.stderr)
+            return None
+
+    sessions = sorted(set().union(*(set(df["session"]) for df in bars.values())))
+    if period == "holdout":
+        start, end = holdout, sessions[-1]
+        prior = storage.count_backtest_runs(conn, cls.name, cls.version, "holdout")
+        print(f"HOLD-OUT RUN for {cls.label()}: previous hold-out runs of this version: {prior}.")
+    else:
+        first = max(sorted(set(df["session"]))[cls.warmup_bars] for df in bars.values())
+        start, end = first, holdout - timedelta(days=1)
+
+    print(f"\n{cls.label()}: {cls.description}")
+    print(f"{period}, {start} to {end}, ${settings.backtest_capital:,.0f} split equally across {len(symbols)} "
+          f"symbols ({feed.upper()} 1-minute bars, regular hours; flat every night)\n")
+    varying = [k for k, v in cls.params.items() if len(v.test) > 1]
+    print(f"  {'RUN / PARAMETERS':<34} {'COST':>6} {'RETURN':>8} {'CAGR':>7} {'MAX DD':>7} "
+          f"{'SHARPE':>6} {'TRADES':>6} {'WIN':>5} {'IN MKT':>6}")
+    ids = []
+    for p in cls.param_grid():
+        label = ", ".join(f"{k}={p[k]}" for k in varying) or "defaults"
+        for cost in settings.backtest_intraday_costs_bp:
+            cfg = backtest_intraday.IntradayConfig(start, end, settings.backtest_capital, cost)
+            result = backtest_intraday.run(strat, p, bars, cfg)
+            run_id = storage.save_backtest(conn, batch, period, result, symbols)
+            ids.append(run_id)
+            print(_bt_row(f"#{run_id} {label}", cost, result.metrics).replace(f"{cost:>4.0f}bp", f"{cost:>4.1f}bp"))
+            if len(symbols) > 1:
+                print("      " + ", ".join(
+                    f"{s} {_pct(m.get('cagr'))}/yr (DD {_pct(m.get('max_drawdown'), 0)})"
+                    for s, m in result.by_symbol.items()))
+    print("  Benchmarks (daily bars)")
+    cfg = backtest.BacktestConfig(start, end, settings.backtest_capital, 0)
+    print(_bt_row(f"buy and hold, {len(symbols)} symbols equal $", 0,
+                  backtest.metrics(backtest.buy_and_hold(daily_bars, cfg), start_value=cfg.capital)))
+    if not spy.empty:
+        print(_bt_row("buy and hold, SPY", 0,
+                      backtest.metrics(backtest.buy_and_hold({"SPY": spy}, cfg), start_value=cfg.capital)))
+    print("  (IN MKT for day strategies = share of trading minutes holding a position)")
+    return ids
+
+
 def _cmd_backtest_export(args: argparse.Namespace) -> int:
     settings = _load(args)
     if settings is None:
@@ -558,6 +634,55 @@ def _cmd_backtest_export(args: argparse.Namespace) -> int:
     params = ", ".join(f"{k}={v}" for k, v in run["params"].items())
     print(f"Run #{args.run_id}: {run['strategy']} v{run['version']} ({params}), {run['cost_bp']:.0f}bp, {run['period']}")
     print(f"{len(trades)} trades written to {path}")
+    return 0
+
+
+def _cmd_data_spreads(args: argparse.Namespace) -> int:
+    from . import spreads
+
+    settings = _load(args)
+    if settings is None:
+        return 2
+    try:
+        symbols = list(_symbols(args, settings))
+    except ConfigError as e:
+        print(e, file=sys.stderr)
+        return 2
+    client = _client(settings)
+    if client is None:
+        return 2
+    now = datetime.now(timezone.utc)
+    today = now.astimezone(data_quality.NEW_YORK).date()
+    try:
+        with client:
+            sessions = data_quality.completed_sessions(client.get_calendar(today - timedelta(days=365), today), now)
+            days = spreads.pick_sessions([s.date for s in sessions], args.sessions)
+            calls = len(days) * len(symbols) * len(spreads.SAMPLE_TIMES)
+            print(f"Sampling full-market quotes: {len(symbols)} symbols x {len(days)} days x "
+                  f"{len(spreads.SAMPLE_TIMES)} times of day ({calls} requests; a few minutes)...")
+            samples = spreads.sample(client, symbols, days)
+    except alpaca.AlpacaError as e:
+        print(e, file=sys.stderr)
+        return 1
+    summary = spreads.summarize(samples)
+
+    print(f"\nHalf-spread in basis points (what a market order pays vs the mid price), "
+          f"{days[0]} to {days[-1]}\n")
+    buckets = ["all", *spreads.BUCKETS]
+    print(f"  {'SYMBOL':<7} " + " ".join(f"{b:>22}" for b in buckets))
+    for sym, by in summary.items():
+        cells = [f"{by[b]['median']:.2f} (p90 {by[b]['p90']:.2f})" if b in by else "-" for b in buckets]
+        print(f"  {sym:<7} " + " ".join(f"{c:>22}" for c in cells))
+    print("\nMedian with the 90th percentile in brackets. Slippage comes on top of this; a backtest cost "
+          "per side of about 2x the median half-spread is a reasonable first estimate.")
+
+    conn = storage.connect(settings.db_file)
+    try:
+        storage.set_meta(conn, "spreads", json.dumps({"measured_utc": now.isoformat(), "days": [d.isoformat() for d in days],
+                                                      "summary": summary}))
+        storage.record_event(conn, "spread_measurement", {"symbols": symbols, "days": len(days), "summary": summary})
+    finally:
+        conn.close()
     return 0
 
 
@@ -603,6 +728,8 @@ def build_parser() -> argparse.ArgumentParser:
     d_pull.add_argument("--timeframe", choices=TIMEFRAMES, default="1Min")
     d_pull.add_argument("--feed", choices=["iex", "sip"], default=None, help="default: [data] feed in settings")
     d_pull.add_argument("--symbols", nargs="+", default=None, help="default: [watchlist] symbols in settings")
+    d_pull.add_argument("--regular-hours", action="store_true",
+                        help="keep only bars from 9:30 to 16:00 New York time (for long minute-bar histories)")
     d_pull.set_defaults(func=_cmd_data_pull)
 
     d_rep = data_sub.add_parser("report", help="coverage and gaps of stored bars per symbol and feed")
@@ -623,6 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     d_stat = data_sub.add_parser("status", help="what is stored per symbol and how fresh it is (no API calls)")
     d_stat.set_defaults(func=_cmd_data_status)
+
+    d_spr = data_sub.add_parser("spreads", help="measure real bid/ask spreads from sampled historical quotes")
+    d_spr.add_argument("--sessions", type=_positive_int, default=15, help="trading days to sample from the past year")
+    d_spr.add_argument("--symbols", nargs="+", default=None)
+    d_spr.set_defaults(func=_cmd_data_spreads)
 
     bt = sub.add_parser("backtest", help="test strategies on stored daily bars")
     bt_sub = bt.add_subparsers(dest="backtest_command", required=True)

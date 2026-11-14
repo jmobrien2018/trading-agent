@@ -49,6 +49,10 @@ capital = 10000                 # per strategy
 costs_bp = [5, 10]              # trading cost per side, in basis points; every test runs at each
 holdout_start = "2025-11-14"    # data from here on stays unseen until final checks
 position_cap_pct = 34           # max size of one position, as % of the strategy's current capital
+# Day strategies (1-minute bars). Costs per side in bp; measured SPY half-spread is ~0.1 bp,
+# so these bracket "spread only" up to "spread plus generous slippage".
+minute_feed = "sip"             # full-market minute bars (`data pull --feed sip --timeframe 1Min --regular-hours`)
+intraday_costs_bp = [0.5, 1, 2, 5]
                                 # (34 lets trend following hold 1/3 in each of 3 symbols; decided 2026-11-14)
 
 [watchlist]

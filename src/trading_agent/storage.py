@@ -249,6 +249,18 @@ def load_daily_bars(conn: sqlite3.Connection, symbol: str, feed: str) -> pd.Data
     return df
 
 
+def load_minute_bars(conn: sqlite3.Connection, symbol: str, feed: str) -> pd.DataFrame:
+    """1-minute bars as a DataFrame indexed by UTC timestamp (open, high, low, close, volume)."""
+    df = pd.read_sql_query(
+        "SELECT ts_utc, open, high, low, close, volume FROM bars "
+        "WHERE symbol = ? AND timeframe = '1Min' AND feed = ? ORDER BY ts_utc",
+        conn,
+        params=(symbol, feed),
+    )
+    df.index = pd.DatetimeIndex(pd.to_datetime(df.pop("ts_utc"), format=_TS_FMT, utc=True), name="ts_utc")
+    return df
+
+
 def save_backtest(conn: sqlite3.Connection, batch: str, period: str, result: Any, symbols: list[str]) -> int:
     """Store one backtest run (a backtest.RunResult) and its trades; returns the run id."""
     cfg = result.config

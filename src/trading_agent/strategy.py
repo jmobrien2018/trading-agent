@@ -53,6 +53,10 @@ class Enter:
 
     reason: str
     rank: float | None = None
+    # Optional price levels set by the strategy itself (e.g. an opening-range low). Used by the
+    # intraday engine; when given they take precedence over the ExitRules stop/target.
+    stop: float | None = None
+    target: float | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,9 @@ class Strategy:
     timeframe: ClassVar[str] = "1Day"
     warmup_bars: ClassVar[int]
     params: ClassVar[dict[str, Param]] = {}
+    # Intraday ("1Min") strategies: close any position at the close of this bar, counted in
+    # minutes after 9:30 New York time (389 = the 15:59 bar, i.e. the session's last minute).
+    flat_by_minute: ClassVar[int] = 389
 
     def signals(self, bars: pd.DataFrame, p: Params) -> pd.DataFrame:
         """Indicator columns, same index as bars. Must use only past and current rows."""

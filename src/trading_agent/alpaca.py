@@ -193,6 +193,23 @@ class AlpacaClient:
                 return
             params["page_token"] = token
 
+    def get_quotes(
+        self, symbol: str, start: datetime, end: datetime, *, feed: str = "sip", limit: int = 1000
+    ) -> list[tuple[datetime, float, float]]:
+        """Historical quotes (time, bid, ask) for one symbol, first page only: enough to sample
+        spreads in a short window. Quotes with a missing or crossed bid/ask are dropped."""
+        body = self._get(self._data, "/v2/stocks/quotes", {
+            "symbols": symbol, "start": _utc_iso(start), "end": _utc_iso(end),
+            "limit": min(limit, MAX_PAGE_SIZE), "feed": feed, "sort": "asc",
+        })
+        rows = (body.get("quotes") or {}).get(symbol) or []
+        out = []
+        for q in rows:
+            bid, ask = q.get("bp"), q.get("ap")
+            if bid and ask and ask >= bid > 0:
+                out.append((_parse_ts(q["t"]), float(bid), float(ask)))
+        return out
+
     def get_snapshots(self, symbols: Sequence[str], *, feed: str = "iex") -> list[Snapshot]:
         """Latest quote, trade and previous close per symbol. Symbols with no data are skipped."""
         if not symbols:

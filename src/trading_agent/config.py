@@ -58,6 +58,8 @@ class Settings:
     backtest_costs_bp: tuple[float, ...]
     holdout_start: date
     backtest_position_cap_pct: float
+    backtest_minute_feed: str
+    backtest_intraday_costs_bp: tuple[float, ...]
     risk: RiskLimits
 
 
@@ -183,8 +185,24 @@ def load_settings(root: Path | None = None) -> Settings:
         backtest_costs_bp=tuple(float(c) for c in costs),
         holdout_start=holdout_start,
         backtest_position_cap_pct=_cap_pct(_require(raw, "backtest", "position_cap_pct")),
+        backtest_minute_feed=_feed(_require(raw, "backtest", "minute_feed"), "[backtest] minute_feed"),
+        backtest_intraday_costs_bp=_costs(_require(raw, "backtest", "intraday_costs_bp"), "intraday_costs_bp"),
         risk=risk,
     )
+
+
+def _feed(value: Any, where: str) -> str:
+    if value not in DATA_FEEDS:
+        raise ConfigError(f"{where} must be one of {sorted(DATA_FEEDS)}, got {value!r}")
+    return value
+
+
+def _costs(value: Any, key: str) -> tuple[float, ...]:
+    if isinstance(value, str) or not isinstance(value, list) or not value or any(
+        isinstance(c, bool) or not isinstance(c, (int, float)) or c < 0 for c in value
+    ):
+        raise ConfigError(f"[backtest] {key} must be a non-empty list of numbers >= 0, got {value!r}")
+    return tuple(float(c) for c in value)
 
 
 def _cap_pct(value: Any) -> float:

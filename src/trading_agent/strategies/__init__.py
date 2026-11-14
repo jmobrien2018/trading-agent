@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from ..strategy import Strategy
+from .intraday_momentum import IntradayMomentum
 from .rsi2_pullback import RSI2Pullback
 from .trend_ma import TrendMA
 from .trend_ma_underlying import TrendMAUnderlying
 
-REGISTRY: dict[str, type[Strategy]] = {cls.name: cls for cls in (TrendMA, RSI2Pullback, TrendMAUnderlying)}
+REGISTRY: dict[str, type[Strategy]] = {
+    cls.name: cls for cls in (TrendMA, RSI2Pullback, TrendMAUnderlying, IntradayMomentum)
+}
