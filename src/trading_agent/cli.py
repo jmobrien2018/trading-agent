@@ -8,9 +8,10 @@ import json
 import logging
 import math
 import sys
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
 from . import __version__, alpaca, credentials, data_quality, pipeline, storage
@@ -436,6 +437,15 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 2
     names = list(REGISTRY) if args.strategy == "all" else [args.strategy]
+    if args.params:
+        if args.strategy == "all":
+            print("--params needs a single --strategy.", file=sys.stderr)
+            return 2
+        try:
+            _select_grid(REGISTRY[args.strategy], args.params)
+        except (ConfigError, ValueError) as e:
+            print(e if isinstance(e, ConfigError) else "--params values look like key=value", file=sys.stderr)
+            return 2
 
     conn = storage.connect(settings.db_file)
     try:
@@ -462,7 +472,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
             cls = REGISTRY[name]
             strat = cls()
             if cls.timeframe == "1Min":  # day strategies: minute bars, intraday engine
-                ids = _run_intraday(conn, settings, cls, symbols, args.period, batch, bars, spy)
+                ids = _run_intraday(conn, settings, cls, symbols, args.period, batch, bars, spy, args.params)
                 if ids is None:
                     if args.strategy != "all":
                         return 1
@@ -501,7 +511,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
             print(f"  {'RUN / PARAMETERS':<34} {'COST':>6} {'RETURN':>8} {'CAGR':>7} {'MAX DD':>7} "
                   f"{'SHARPE':>6} {'TRADES':>6} {'WIN':>5} {'IN MKT':>6}")
             fills = ["open", "close"] if args.fill == "both" else [args.fill]
-            for p in cls.param_grid():
+            for p in _select_grid(cls, args.params):
                 label = ", ".join(f"{k}={p[k]}" for k in varying) or "defaults"
                 for fill in fills:
                     shown = f"{label}, fill at {fill}" if len(fills) > 1 else label
@@ -552,7 +562,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
 
 
 def _run_intraday(conn, settings: Settings, cls, symbols: list[str], period: str, batch: str,
-                  daily_bars: dict, spy) -> list[int] | None:
+                  daily_bars: dict, spy, params: list[str] | None = None) -> list[int] | None:
     """Backtest a day strategy on stored minute bars; prints its table. None on missing data."""
     from . import backtest, backtest_intraday
     from .strategy import no_lookahead
@@ -591,7 +601,7 @@ def _run_intraday(conn, settings: Settings, cls, symbols: list[str], period: str
     print(f"  {'RUN / PARAMETERS':<34} {'COST':>6} {'RETURN':>8} {'CAGR':>7} {'MAX DD':>7} "
           f"{'SHARPE':>6} {'TRADES':>6} {'WIN':>5} {'IN MKT':>6}")
     ids = []
-    for p in cls.param_grid():
+    for p in _select_grid(cls, params):
         label = ", ".join(f"{k}={p[k]}" for k in varying) or "defaults"
         for cost in settings.backtest_intraday_costs_bp:
             cfg = backtest_intraday.IntradayConfig(start, end, settings.backtest_capital, cost)
@@ -612,6 +622,115 @@ def _run_intraday(conn, settings: Settings, cls, symbols: list[str], period: str
                       backtest.metrics(backtest.buy_and_hold({"SPY": spy}, cfg), start_value=cfg.capital)))
     print("  (IN MKT for day strategies = share of trading minutes holding a position)")
     return ids
+
+
+def _select_grid(cls, wanted: list[str] | None) -> list:
+    """The strategy's parameter grid, or only the sets matching `--params key=value ...`."""
+    grid = cls.param_grid()
+    if not wanted:
+        return grid
+    pairs = dict(w.split("=", 1) for w in wanted)
+    unknown = set(pairs) - set(cls.params)
+    if unknown:
+        raise ConfigError(f"{cls.name} has no parameter {', '.join(sorted(unknown))}; it has {', '.join(cls.params)}")
+    chosen = [p for p in grid if all(str(p[k]) == v for k, v in pairs.items())]
+    if not chosen:
+        options = "; ".join(p.label() for p in grid)
+        raise ConfigError(f"No {cls.name} parameter set matches {' '.join(wanted)}. Options: {options}")
+    return chosen
+
+
+def _wf_label(cls, p) -> str:
+    varying = [k for k, v in cls.params.items() if len(v.test) > 1]
+    return f"{cls.name} " + (", ".join(f"{k}={p[k]}" for k in varying) or "defaults")
+
+
+def _cmd_backtest_walkforward(args: argparse.Namespace) -> int:
+    from . import backtest, backtest_intraday, walkforward
+    from .strategies import REGISTRY
+
+    settings = _load(args)
+    if settings is None:
+        return 2
+    try:
+        symbols = list(_symbols(args, settings))
+    except ConfigError as e:
+        print(e, file=sys.stderr)
+        return 2
+    classes = [REGISTRY[n] for n in args.strategy]
+    if len({c.timeframe for c in classes}) > 1:
+        print("Walk-forward compares strategies on the same timeframe; don't mix day and swing.", file=sys.stderr)
+        return 2
+    intraday = classes[0].timeframe == "1Min"
+    capital = settings.backtest_capital
+    end = settings.holdout_start - timedelta(days=1)
+
+    conn = storage.connect(settings.db_file)
+    try:
+        daily = {s: storage.load_daily_bars(conn, s, settings.daily_feed) for s in symbols}
+        candidates: dict[str, pd.Series] = {}
+        if intraday:
+            minute = {s: storage.load_minute_bars(conn, s, settings.backtest_minute_feed) for s in symbols}
+            if any(df.empty for df in minute.values()):
+                print("Missing minute bars; see `trading-agent backtest run` for the pull command.", file=sys.stderr)
+                return 1
+            bars = {s: backtest_intraday.prepare(df) for s, df in minute.items()}
+            warm = max(c.warmup_bars for c in classes)
+            start = max(sorted(set(df["session"]))[warm] for df in bars.values())
+            for cls in classes:
+                for p in cls.param_grid():
+                    r = backtest_intraday.run(cls(), p, bars, backtest_intraday.IntradayConfig(start, end, capital, args.cost))
+                    candidates[_wf_label(cls, p)] = walkforward.daily_returns(r.equity, capital)
+        else:
+            if any(df.empty for df in daily.values()):
+                print("Missing daily bars. Run: trading-agent data refresh", file=sys.stderr)
+                return 1
+            start = backtest.first_tradable_date(daily, max(c.warmup_bars for c in classes))
+            for cls in classes:
+                strat = cls()
+                sources = {strat.signal_symbol(s, cls.defaults()) for s in symbols} - set(daily)
+                signal_bars = {s: storage.load_daily_bars(conn, s, settings.daily_feed) for s in sources}
+                for p in cls.param_grid():
+                    cfg = backtest.BacktestConfig(start, end, capital, args.cost,
+                                                  position_cap_pct=settings.backtest_position_cap_pct)
+                    r = backtest.run(strat, p, daily, cfg, signal_bars=signal_bars)
+                    candidates[_wf_label(cls, p)] = walkforward.daily_returns(r.equity, capital)
+
+        first_test_year = start.year + args.train_years
+        wf = walkforward.walk_forward(candidates, first_test_year, capital)
+        bh_cfg = backtest.BacktestConfig(date(first_test_year, 1, 1), end, capital, args.cost)
+        bh = backtest.metrics(backtest.buy_and_hold(daily, bh_cfg), start_value=capital)
+        spy = storage.load_daily_bars(conn, "SPY", settings.daily_feed)
+        spy_bh = backtest.metrics(backtest.buy_and_hold({"SPY": spy}, bh_cfg), start_value=capital) if not spy.empty else {}
+        storage.record_event(conn, "walk_forward", {
+            "strategies": args.strategy, "symbols": symbols, "cost_bp": args.cost, "first_test_year": first_test_year,
+            "choices": [(c.year, c.chosen, c.test_return) for c in wf.years], "metrics": wf.metrics,
+            "final_choice": wf.final_choice,
+        })
+    finally:
+        conn.close()
+
+    print(f"Walk-forward: {', '.join(args.strategy)} on {' '.join(symbols)}, {args.cost:g} bp per side, "
+          f"{len(candidates)} candidate settings")
+    print(f"Each year, pick the setting with the best Sharpe ratio on all earlier days (from {start}), "
+          f"then test it on that year.\n")
+    print(f"  {'YEAR':<6} {'CHOSEN (from earlier years)':<40} {'RETURN':>8}   BEST IN HINDSIGHT THAT YEAR")
+    for c in wf.years:
+        print(f"  {c.year:<6} {c.chosen:<40} {_pct(c.test_return):>8}   {c.best_in_hindsight} ({_pct(c.best_in_hindsight_return)})")
+    m = wf.metrics
+    print(f"\n  Out-of-sample {m['start']} to {m['end']}: {_pct(m['cagr'])} a year, worst fall {_pct(m['max_drawdown'])}, "
+          f"Sharpe {_num(m['sharpe'])}")
+    print(f"  Buy and hold, same symbols, same years: {_pct(bh.get('cagr'))} a year, worst fall {_pct(bh.get('max_drawdown'))}, "
+          f"Sharpe {_num(bh.get('sharpe'))}")
+    if spy_bh:
+        print(f"  Buy and hold SPY, same years:           {_pct(spy_bh.get('cagr'))} a year, worst fall "
+              f"{_pct(spy_bh.get('max_drawdown'))}, Sharpe {_num(spy_bh.get('sharpe'))}")
+    print("\n  Each setting held the whole time, same years (for comparison; picking from this list uses hindsight):")
+    for label, cm in sorted(wf.candidates_same_years.items(), key=lambda kv: -kv[1].get("sharpe", -9)):
+        print(f"    {label:<40} {_pct(cm.get('cagr')):>7} a year, worst fall {_pct(cm.get('max_drawdown')):>7}, "
+              f"Sharpe {_num(cm.get('sharpe'))}")
+    print(f"\n  Setting chosen on all in-sample data (the one to test on the hold-out year): {wf.final_choice}")
+    return 0
 
 
 def _cmd_backtest_export(args: argparse.Namespace) -> int:
@@ -765,9 +884,19 @@ def build_parser() -> argparse.ArgumentParser:
     b_run.add_argument("--period", choices=["in-sample", "holdout"], default="in-sample",
                        help="in-sample (default) tunes and compares; holdout is the final check on unseen data")
     b_run.add_argument("--symbols", nargs="+", default=None, help="default: [watchlist] symbols in settings")
+    b_run.add_argument("--params", nargs="+", default=None, metavar="KEY=VALUE",
+                       help="run only the parameter set(s) matching these values, e.g. ma_days=200 (one strategy)")
     b_run.add_argument("--fill", choices=["open", "close", "both"], default="open",
                        help="when orders fill: next day's open (default), same day's close, or both")
     b_run.set_defaults(func=_cmd_backtest_run)
+
+    b_wf = bt_sub.add_parser("walkforward", help="out-of-sample test of picking the best setting so far, year by year")
+    b_wf.add_argument("--strategy", nargs="+", required=True, choices=list(REGISTRY),
+                      help="one or more strategies on the same timeframe; every parameter set is a candidate")
+    b_wf.add_argument("--cost", type=float, required=True, help="cost per side in bp (e.g. 5 for swing, 2 for TQQQ day)")
+    b_wf.add_argument("--symbols", nargs="+", default=None)
+    b_wf.add_argument("--train-years", type=_positive_int, default=2, help="years of history before the first test year")
+    b_wf.set_defaults(func=_cmd_backtest_walkforward)
 
     b_exp = bt_sub.add_parser("export", help="write a run's trades to a CSV file")
     b_exp.add_argument("run_id", type=int)

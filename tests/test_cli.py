@@ -207,6 +207,16 @@ def test_backtest_run_and_export(project_root, capsys):
     out = capsys.readouterr().out
     assert "HOLD-OUT RUN" in out and "Previous hold-out runs of this version: 0" in out
 
+    assert main([*root, "backtest", "run", "--strategy", "trend_ma", "--params", "ma_days=200"]) == 0
+    out = capsys.readouterr().out
+    assert "ma_days=200" in out and "ma_days=100" not in out
+    assert main([*root, "backtest", "run", "--strategy", "trend_ma", "--params", "ma_days=7"]) == 2
+    assert "Options:" in capsys.readouterr().err
+
+    assert main([*root, "backtest", "walkforward", "--strategy", "trend_ma", "--cost", "5", "--train-years", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "Walk-forward: trend_ma" in out and "Out-of-sample" in out and "hold-out year" in out
+
     assert main([*root, "backtest", "export", "1"]) == 0
     assert "trades written to" in capsys.readouterr().out
     assert (project_root / "data" / "exports" / "backtest_1_trend_ma_trades.csv").is_file()

@@ -97,6 +97,18 @@ trading-agent backtest run --strategy trend_ma --period holdout   # final check 
 - Every run and trade is saved to the database. Hold-out runs are counted, so it's visible how often the unseen
   year has been used.
 
+### Walk-forward and the hold-out year
+
+```powershell
+# Each year, pick the setting with the best Sharpe on all earlier years, then test it on that year
+trading-agent backtest walkforward --strategy trend_ma trend_ma_underlying --cost 5
+trading-agent backtest walkforward --strategy orb --symbols TQQQ --cost 2
+# Run only the chosen setting, once, on the unseen hold-out year
+trading-agent backtest run --strategy trend_ma_underlying --params ma_days=150 --period holdout
+```
+
+Hold-out runs are counted per strategy version. Tuning on hold-out results defeats their purpose.
+
 ### Day strategies (1-minute bars)
 
 ```powershell
