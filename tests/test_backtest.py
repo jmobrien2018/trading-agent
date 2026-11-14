@@ -79,7 +79,8 @@ def test_indicators_basic_values():
 def test_param_grids_match_spec():
     assert len(TrendMA.param_grid()) == 3
     assert len(RSI2Pullback.param_grid()) == 8  # 2 x 2 x 2, as listed in the spec
-    assert set(REGISTRY) == {"trend_ma", "rsi2_pullback", "trend_ma_underlying", "intraday_momentum"}
+    assert set(REGISTRY) == {"trend_ma", "rsi2_pullback", "trend_ma_underlying", "intraday_momentum", "orb",
+                             "gap_fill", "gap_go", "vwap_trend"}
 
 
 @pytest.mark.parametrize("cls", [TrendMA, RSI2Pullback])
