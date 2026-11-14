@@ -168,6 +168,50 @@ def test_refresh_skips_when_locked(project_root, fake_api, capsys):
     assert fake_api.requests == []
 
 
+def test_backtest_run_and_export(project_root, capsys):
+    from datetime import datetime, time, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    import numpy as np
+
+    from trading_agent.models import Bar
+
+    ny = ZoneInfo("America/New_York")
+    (project_root / "config" / "settings.local.toml").write_text('[watchlist]\nsymbols = ["SPY", "AAA"]\n')
+    conn = storage.connect(project_root / "data" / "trading_agent.sqlite3")
+    rng = np.random.default_rng(7)
+    day = datetime(2024, 1, 2).date()
+    for sym in ("SPY", "AAA"):
+        price, rows = 100.0, []
+        for i in range(700):  # about 2 years either side of the 2025-11-14 hold-out start
+            d = day + timedelta(days=i)
+            price *= float(np.exp(rng.normal(0.0004, 0.015)))
+            ts = datetime.combine(d, time(0), ny).astimezone(timezone.utc)
+            rows.append(Bar(sym, "1Day", ts, price, price * 1.01, price * 0.99, price, 1000))
+        storage.upsert_bars(conn, rows, "sip")
+    conn.close()
+
+    root = ["--root", str(project_root)]
+    assert main([*root, "backtest", "run"]) == 0
+    out = capsys.readouterr().out
+    assert "trend_ma v1" in out and "rsi2_pullback v1" in out
+    assert "in-sample" in out and "to 2025-11-13" in out  # stops before the hold-out year
+    assert "#1 ma_days=100" in out and "buy and hold, SPY" in out
+    assert "Combined account: trend_ma (ma_days=200) + rsi2_pullback" in out and "combined, 2 strategies" in out
+
+    assert main([*root, "backtest", "run", "--strategy", "rsi2_pullback", "--fill", "both"]) == 0
+    out = capsys.readouterr().out
+    assert "fill at open" in out and "fill at close" in out and "Combined" not in out
+
+    assert main([*root, "backtest", "run", "--strategy", "trend_ma", "--period", "holdout"]) == 0
+    out = capsys.readouterr().out
+    assert "HOLD-OUT RUN" in out and "Previous hold-out runs of this version: 0" in out
+
+    assert main([*root, "backtest", "export", "1"]) == 0
+    assert "trades written to" in capsys.readouterr().out
+    assert (project_root / "data" / "exports" / "backtest_1_trend_ma_trades.csv").is_file()
+
+
 def test_data_pull_without_keys_explains(project_root, capsys):
     assert main(["--root", str(project_root), "data", "pull"]) == 2
     assert "trading-agent secrets set ALPACA_PAPER_API_KEY" in capsys.readouterr().err

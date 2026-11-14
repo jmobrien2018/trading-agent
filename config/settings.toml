@@ -21,12 +21,18 @@ data_base_url = "https://data.alpaca.markets"
 # "iex" = free real-time feed, IEX exchange only (thinner: only IEX trades make bars).
 # "sip" = all US exchanges; on the free plan only data older than 15 minutes.
 feed = "iex"
+# Feed for daily bars. SIP (all exchanges) gives true market open/high/low/close and history
+# back to 2016; the 15-minute delay doesn't matter for daily bars.
+daily_feed = "sip"
 # Price adjustment for historical bars: raw | split | dividend | all
 adjustment = "split"
+# Daily bars: "all" adjusts for splits and dividends, so backtests measure total return.
+# Each new dividend re-scales past prices, so refresh re-pulls the full daily history once a day.
+daily_adjustment = "all"
 
 [history]
 # How far back `data refresh` backfills a symbol the first time it sees it.
-daily_years = 5      # daily bars, for swing strategies and longer backtests
+daily_years = 10     # daily bars, for swing strategies and longer backtests
 minute_days = 90     # 1-minute bars, for day strategies (~60 sessions)
 
 [refresh]
@@ -37,14 +43,25 @@ min_coverage = 0.95
 # While the market is open, warn when a symbol's newest 1-minute bar is older than this.
 stale_minutes = 15
 
+[backtest]
+# Decided 2026-11-14 (plan doc, Strategy format spec tab).
+capital = 10000                 # per strategy
+costs_bp = [5, 10]              # trading cost per side, in basis points; every test runs at each
+holdout_start = "2025-11-14"    # data from here on stays unseen until final checks
+position_cap_pct = 34           # max size of one position, as % of the strategy's current capital
+                                # (34 lets trend following hold 1/3 in each of 3 symbols; decided 2026-11-14)
+
 [watchlist]
-# Phase 1 test watchlist for data-quality checks: index ETFs plus liquid large caps.
-symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "AMD"]
+# Decided 2026-11-14: index ETFs only, to avoid hindsight in picking individual stocks.
+# TQQQ is a 3x daily-leveraged Nasdaq-100 ETF: much larger swings and drawdowns than QQQ.
+symbols = ["SPY", "QQQ", "TQQQ"]
+# Earlier lists, kept for reference:
+# symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "AMD"]   # Phase 1 data-quality test
 # symbols = ["SPY", "QQQ", "SCHD", "SPMO", "DGRO", "VTV"]
 
 [risk]
 # Placeholders. Enforced in code from Phase 4 (risk engine).
-max_position_usd = 1000
+max_position_usd = 2000
 max_daily_loss_usd = 200
 max_open_positions = 5
 max_trades_per_day = 10

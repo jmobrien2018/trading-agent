@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -43,14 +44,20 @@ class Settings:
     broker_name: str
     broker_base_url: str
     data_base_url: str
-    data_feed: str
-    data_adjustment: str
+    data_feed: str  # 1-minute (intraday) bars and quotes
+    daily_feed: str  # daily bars
+    data_adjustment: str  # 1-minute bars
+    daily_adjustment: str  # daily bars
     watchlist: tuple[str, ...]
     history_daily_years: int
     history_minute_days: int
     refresh_timeframes: tuple[str, ...]
     min_coverage: float
     stale_minutes: int
+    backtest_capital: float
+    backtest_costs_bp: tuple[float, ...]
+    holdout_start: date
+    backtest_position_cap_pct: float
     risk: RiskLimits
 
 
@@ -120,9 +127,15 @@ def load_settings(root: Path | None = None) -> Settings:
     feed = _require(raw, "data", "feed")
     if feed not in DATA_FEEDS:
         raise ConfigError(f"[data] feed must be one of {sorted(DATA_FEEDS)}, got {feed!r}")
+    daily_feed = _require(raw, "data", "daily_feed")
+    if daily_feed not in DATA_FEEDS:
+        raise ConfigError(f"[data] daily_feed must be one of {sorted(DATA_FEEDS)}, got {daily_feed!r}")
     adjustment = _require(raw, "data", "adjustment")
     if adjustment not in ADJUSTMENTS:
         raise ConfigError(f"[data] adjustment must be one of {sorted(ADJUSTMENTS)}, got {adjustment!r}")
+    daily_adjustment = _require(raw, "data", "daily_adjustment")
+    if daily_adjustment not in ADJUSTMENTS:
+        raise ConfigError(f"[data] daily_adjustment must be one of {sorted(ADJUSTMENTS)}, got {daily_adjustment!r}")
 
     timeframes = _require(raw, "refresh", "timeframes")
     if (
@@ -136,6 +149,17 @@ def load_settings(root: Path | None = None) -> Settings:
     if min_coverage > 1:
         raise ConfigError(f"[refresh] min_coverage is a fraction from 0 to 1, got {min_coverage!r}")
 
+    costs = _require(raw, "backtest", "costs_bp")
+    if isinstance(costs, str) or not isinstance(costs, list) or not costs or any(
+        isinstance(c, bool) or not isinstance(c, (int, float)) or c < 0 for c in costs
+    ):
+        raise ConfigError(f"[backtest] costs_bp must be a non-empty list of numbers >= 0, got {costs!r}")
+    holdout = _require(raw, "backtest", "holdout_start")
+    try:
+        holdout_start = holdout if isinstance(holdout, date) else date.fromisoformat(str(holdout))
+    except ValueError:
+        raise ConfigError(f"[backtest] holdout_start must be a date like 2025-11-14, got {holdout!r}") from None
+
     return Settings(
         root=root,
         mode=mode,
@@ -146,15 +170,28 @@ def load_settings(root: Path | None = None) -> Settings:
         broker_base_url=broker_base_url,
         data_base_url=_require(raw, "broker", "data_base_url"),
         data_feed=feed,
+        daily_feed=daily_feed,
         data_adjustment=adjustment,
+        daily_adjustment=daily_adjustment,
         watchlist=parse_symbols(_require(raw, "watchlist", "symbols")),
         history_daily_years=_positive("daily_years", _require(raw, "history", "daily_years"), int, "history"),
         history_minute_days=_positive("minute_days", _require(raw, "history", "minute_days"), int, "history"),
         refresh_timeframes=tuple(dict.fromkeys(timeframes)),
         min_coverage=min_coverage,
         stale_minutes=_positive("stale_minutes", _require(raw, "refresh", "stale_minutes"), int, "refresh"),
+        backtest_capital=_positive("capital", _require(raw, "backtest", "capital"), float, "backtest"),
+        backtest_costs_bp=tuple(float(c) for c in costs),
+        holdout_start=holdout_start,
+        backtest_position_cap_pct=_cap_pct(_require(raw, "backtest", "position_cap_pct")),
         risk=risk,
     )
+
+
+def _cap_pct(value: Any) -> float:
+    pct = _positive("position_cap_pct", value, float, "backtest")
+    if pct > 100:
+        raise ConfigError(f"[backtest] position_cap_pct is a percent from 0 to 100, got {value!r}")
+    return pct
 
 
 def parse_symbols(value: Any) -> tuple[str, ...]:

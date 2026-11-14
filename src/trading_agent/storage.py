@@ -13,9 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
 from .models import Bar, Snapshot
 
-SCHEMA_VERSION = 3
+_NEW_YORK = ZoneInfo("America/New_York")
+
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -75,6 +81,41 @@ CREATE TABLE IF NOT EXISTS quotes (
     fetched_utc    TEXT NOT NULL,
     PRIMARY KEY (symbol, feed, quote_ts_utc)
 ) WITHOUT ROWID;
+
+-- Backtest results (Phase 3). One row per strategy x parameter set x cost level.
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_utc TEXT NOT NULL,
+    batch       TEXT NOT NULL,  -- groups the runs from one `backtest run` command
+    strategy    TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    params      TEXT NOT NULL,  -- JSON
+    cost_bp     REAL NOT NULL,
+    period      TEXT NOT NULL,  -- in-sample | holdout
+    fill        TEXT NOT NULL DEFAULT 'open',  -- open (next day's open) | close (same day's close)
+    start_date  TEXT NOT NULL,
+    end_date    TEXT NOT NULL,
+    capital     REAL NOT NULL,
+    symbols     TEXT NOT NULL,  -- JSON
+    metrics     TEXT NOT NULL   -- JSON
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy ON backtest_runs (strategy, version, period);
+
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    run_id       INTEGER NOT NULL REFERENCES backtest_runs (id),
+    symbol       TEXT NOT NULL,
+    entry_date   TEXT NOT NULL,
+    entry_price  REAL NOT NULL,
+    exit_date    TEXT NOT NULL,
+    exit_price   REAL NOT NULL,
+    qty          REAL NOT NULL,
+    pnl          REAL NOT NULL,
+    return_pct   REAL NOT NULL,
+    bars_held    INTEGER NOT NULL,
+    entry_reason TEXT NOT NULL,
+    exit_reason  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades (run_id);
 """
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
@@ -114,6 +155,10 @@ def connect(db_file: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     with conn:
         conn.executescript(_SCHEMA)
+        # Schema 5: backtest_runs gained `fill`; add it to databases created before that.
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(backtest_runs)")}
+        if "fill" not in columns:
+            conn.execute("ALTER TABLE backtest_runs ADD COLUMN fill TEXT NOT NULL DEFAULT 'open'")
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -189,6 +234,74 @@ def insert_snapshots(conn: sqlite3.Connection, snapshots: Iterable[Snapshot], fe
             rows,
         )
     return len(rows)
+
+
+def load_daily_bars(conn: sqlite3.Connection, symbol: str, feed: str) -> pd.DataFrame:
+    """Daily bars as a DataFrame indexed by New York trading date (open, high, low, close, volume)."""
+    rows = conn.execute(
+        "SELECT ts_utc, open, high, low, close, volume FROM bars "
+        "WHERE symbol = ? AND timeframe = '1Day' AND feed = ? ORDER BY ts_utc",
+        (symbol, feed),
+    ).fetchall()
+    df = pd.DataFrame(rows, columns=["ts_utc", "open", "high", "low", "close", "volume"])
+    # Daily bars are stamped at New York midnight; that date is the trading day.
+    df.index = pd.Index([_parse(t).astimezone(_NEW_YORK).date() for t in df.pop("ts_utc")], name="date")
+    return df
+
+
+def save_backtest(conn: sqlite3.Connection, batch: str, period: str, result: Any, symbols: list[str]) -> int:
+    """Store one backtest run (a backtest.RunResult) and its trades; returns the run id."""
+    cfg = result.config
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO backtest_runs (created_utc, batch, strategy, version, params, cost_bp, period, fill, "
+            "start_date, end_date, capital, symbols, metrics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _ts(datetime.now(timezone.utc)), batch, result.strategy, result.version,
+                json.dumps(dict(result.params), default=str), cfg.cost_bp, period, cfg.fill,
+                cfg.start.isoformat(), cfg.end.isoformat(), cfg.capital,
+                json.dumps(list(symbols)),
+                json.dumps(result.metrics, default=str),
+            ),
+        )
+        run_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO backtest_trades (run_id, symbol, entry_date, entry_price, exit_date, exit_price, qty, "
+            "pnl, return_pct, bars_held, entry_reason, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (run_id, t.symbol, t.entry_date.isoformat(), t.entry_price, t.exit_date.isoformat(), t.exit_price,
+                 t.qty, t.pnl, t.return_pct, t.bars_held, t.entry_reason, t.exit_reason)
+                for t in result.trades
+            ],
+        )
+    return run_id
+
+
+def backtest_trades(conn: sqlite3.Connection, run_id: int) -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT symbol, entry_date, entry_price, exit_date, exit_price, qty, pnl, return_pct, bars_held, "
+        "entry_reason, exit_reason FROM backtest_trades WHERE run_id = ? ORDER BY entry_date, symbol",
+        conn,
+        params=(run_id,),
+    )
+
+
+def get_backtest_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM backtest_runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    for k in ("params", "symbols", "metrics"):
+        out[k] = json.loads(out[k])
+    return out
+
+
+def count_backtest_runs(conn: sqlite3.Connection, strategy: str, version: int, period: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT batch) FROM backtest_runs WHERE strategy = ? AND version = ? AND period = ?",
+        (strategy, version, period),
+    ).fetchone()
+    return int(row[0])
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import logging
+import math
 import sys
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,9 @@ from .models import TIMEFRAMES
 from .pipeline import pull_window
 
 log = logging.getLogger("trading_agent")
+
+# Strategies added together in the "combined account" line of `backtest run` (each keeps its own slice).
+COMBINED = ("trend_ma", "rsi2_pullback")
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -164,7 +168,7 @@ def _cmd_data_pull(args: argparse.Namespace) -> int:
     except ConfigError as e:
         print(e, file=sys.stderr)
         return 2
-    feed = args.feed or settings.data_feed
+    feed = args.feed or pipeline.feed_for(args.timeframe, settings)
     client = _client(settings)
     if client is None:
         return 2
@@ -177,7 +181,8 @@ def _cmd_data_pull(args: argparse.Namespace) -> int:
         with client:
             is_open = bool(client.get_clock().get("is_open"))
             counts, newest = pipeline.ingest(
-                client, conn, symbols, args.timeframe, start, end, feed=feed, adjustment=settings.data_adjustment
+                client, conn, symbols, args.timeframe, start, end, feed=feed,
+                adjustment=pipeline.adjustment_for(args.timeframe, settings),
             )
         total = sum(counts.values())
         storage.record_event(conn, "data_pull", {
@@ -309,6 +314,8 @@ def _cmd_data_refresh(args: argparse.Namespace) -> int:
     for tf, counts in result.written.items():
         new = result.backfilled.get(tf, [])
         note = f"  (backfilled {', '.join(new)})" if new else ""
+        if tf in result.full_repull:
+            note = "  (full history re-pulled for dividend adjustment, once a day)"
         print(f"  {tf:<5} {sum(counts.values()):>9,} bars written for {len(counts)} symbol(s){note}")
     if result.market_open:
         print(f"  quotes {result.snapshots:>8} snapshots saved")
@@ -399,6 +406,161 @@ def _cmd_data_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pct(x: float | None, digits: int = 1) -> str:
+    return "-" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x * 100:.{digits}f}%"
+
+
+def _num(x: float | None, digits: int = 2) -> str:
+    return "-" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.{digits}f}"
+
+
+def _bt_row(label: str, cost: float, m: dict) -> str:
+    return (f"  {label:<34} {cost:>4.0f}bp {_pct(m.get('total_return')):>8} {_pct(m.get('cagr')):>7} "
+            f"{_pct(m.get('max_drawdown')):>7} {_num(m.get('sharpe')):>6} {m.get('trades', '-'):>6} "
+            f"{_pct(m.get('win_rate'), 0):>5} {_pct(m.get('exposure'), 0):>6}")
+
+
+def _cmd_backtest_run(args: argparse.Namespace) -> int:
+    from . import backtest
+    from .strategies import REGISTRY
+    from .strategy import no_lookahead
+
+    settings = _load(args)
+    if settings is None:
+        return 2
+    try:
+        symbols = list(_symbols(args, settings))
+    except ConfigError as e:
+        print(e, file=sys.stderr)
+        return 2
+    names = list(REGISTRY) if args.strategy == "all" else [args.strategy]
+
+    conn = storage.connect(settings.db_file)
+    try:
+        feed = settings.daily_feed
+        bars = {s: storage.load_daily_bars(conn, s, feed) for s in symbols}
+        missing = [s for s, df in bars.items() if df.empty]
+        if missing:
+            print(f"No daily bars ({feed.upper()} feed) for {', '.join(missing)}. Run: trading-agent data refresh",
+                  file=sys.stderr)
+            return 1
+        spy = bars.get("SPY")
+        if spy is None:
+            spy = storage.load_daily_bars(conn, "SPY", feed)
+
+        holdout = settings.holdout_start
+        last_date = max(df.index[-1] for df in bars.values())
+        batch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_ids: list[int] = []
+        defaults_runs: dict[float, list] = {}  # cost -> [(strategy class, result)] at default settings
+
+        for name in names:
+            cls = REGISTRY[name]
+            strat = cls()
+            # Symbols used only as signal sources (e.g. QQQ when trading TQQQ alone).
+            sources = {strat.signal_symbol(s, cls.defaults()) for s in symbols} - set(bars)
+            signal_bars = {s: storage.load_daily_bars(conn, s, feed) for s in sources}
+            if any(df.empty for df in signal_bars.values()):
+                print(f"{cls.label()} needs daily bars for {', '.join(sorted(sources))}. "
+                      f"Add them to [watchlist] and run: trading-agent data refresh", file=sys.stderr)
+                return 1
+            for s, df in bars.items():  # refuse to run a strategy that peeks at the future
+                report = no_lookahead(strat, df.loc[: holdout - timedelta(days=1)], cls.defaults())
+                if not report.ok:
+                    print(f"{cls.label()} looks ahead on {s}: {report.problems[0]}", file=sys.stderr)
+                    return 1
+            if args.period == "holdout":
+                prior = storage.count_backtest_runs(conn, cls.name, cls.version, "holdout")
+                start, end = holdout, last_date
+                print(f"HOLD-OUT RUN for {cls.label()}: data from {holdout} was kept unseen. "
+                      f"Previous hold-out runs of this version: {prior}. Use this result as final; don't tune on it.")
+            else:
+                start = backtest.first_tradable_date(bars, cls.warmup_bars)
+                end = holdout - timedelta(days=1)
+
+            print(f"\n{cls.label()}: {cls.description}")
+            print(f"{args.period}, {start} to {end}, ${settings.backtest_capital:,.0f}, "
+                  f"{len(symbols)} symbols ({feed.upper()} daily bars, split- and dividend-adjusted)\n")
+            varying = [k for k, v in cls.params.items() if len(v.test) > 1]
+            fixed = {k: v.test[0] for k, v in cls.params.items() if len(v.test) == 1}
+            if fixed:
+                print("Fixed: " + ", ".join(f"{k}={v}" for k, v in fixed.items()) + "\n")
+            print(f"  {'RUN / PARAMETERS':<34} {'COST':>6} {'RETURN':>8} {'CAGR':>7} {'MAX DD':>7} "
+                  f"{'SHARPE':>6} {'TRADES':>6} {'WIN':>5} {'IN MKT':>6}")
+            fills = ["open", "close"] if args.fill == "both" else [args.fill]
+            for p in cls.param_grid():
+                label = ", ".join(f"{k}={p[k]}" for k in varying) or "defaults"
+                for fill in fills:
+                    shown = f"{label}, fill at {fill}" if len(fills) > 1 else label
+                    for cost in settings.backtest_costs_bp:
+                        cfg = backtest.BacktestConfig(start, end, settings.backtest_capital, cost,
+                                                      position_cap_pct=settings.backtest_position_cap_pct, fill=fill)
+                        result = backtest.run(strat, p, bars, cfg, signal_bars=signal_bars)
+                        run_id = storage.save_backtest(conn, batch, args.period, result, symbols)
+                        run_ids.append(run_id)
+                        print(_bt_row(f"#{run_id} {shown}", cost, result.metrics))
+                        if p == cls.defaults() and fill == "open" and name in COMBINED:
+                            defaults_runs.setdefault(cost, []).append((cls, result))
+            print("  Benchmarks")
+            for cost in settings.backtest_costs_bp:
+                cfg = backtest.BacktestConfig(start, end, settings.backtest_capital, cost)
+                eq = backtest.buy_and_hold(bars, cfg)
+                print(_bt_row(f"buy and hold, {len(symbols)} symbols equal $", cost,
+                              backtest.metrics(eq, start_value=cfg.capital)))
+                if not spy.empty:
+                    spy_eq = backtest.buy_and_hold({"SPY": spy}, cfg)
+                    print(_bt_row("buy and hold, SPY", cost, backtest.metrics(spy_eq, start_value=cfg.capital)))
+
+        # Combined: every strategy at its default settings, each with its own fixed slice of money,
+        # added together as one account.
+        if defaults_runs and len(next(iter(defaults_runs.values()))) > 1:
+            parts = defaults_runs[next(iter(defaults_runs))]
+            who = " + ".join(f"{cls.name} ({cls.defaults().label()})" for cls, _ in parts)
+            print(f"\nCombined account: {who}")
+            print(f"${settings.backtest_capital:,.0f} each, kept separate (fixed slices), added together\n")
+            for cost, runs in defaults_runs.items():
+                equity = sum(r.equity for _, r in runs).dropna()
+                invested = sum(r.equity * r.exposure for _, r in runs).dropna()
+                m = backtest.metrics(equity, start_value=settings.backtest_capital * len(runs))
+                m["exposure"] = float((invested / equity).mean())
+                m["trades"] = sum(len(r.trades) for _, r in runs)
+                print(_bt_row(f"combined, {len(runs)} strategies", cost, m))
+
+        storage.record_event(conn, "backtest_run", {
+            "batch": batch, "period": args.period, "strategies": names, "symbols": symbols,
+            "run_ids": [run_ids[0], run_ids[-1]] if run_ids else [],
+        })
+    finally:
+        conn.close()
+
+    print("\nRETURN and CAGR are after costs. MAX DD = worst peak-to-trough fall. IN MKT = average share of "
+          "capital invested.\nTrades for a run: trading-agent backtest export <run number>")
+    return 0
+
+
+def _cmd_backtest_export(args: argparse.Namespace) -> int:
+    settings = _load(args)
+    if settings is None:
+        return 2
+    conn = storage.connect(settings.db_file)
+    try:
+        run = storage.get_backtest_run(conn, args.run_id)
+        if run is None:
+            print(f"No backtest run #{args.run_id}.", file=sys.stderr)
+            return 1
+        trades = storage.backtest_trades(conn, args.run_id)
+    finally:
+        conn.close()
+    out_dir = settings.data_dir / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"backtest_{args.run_id}_{run['strategy']}_trades.csv"
+    trades.to_csv(path, index=False)
+    params = ", ".join(f"{k}={v}" for k, v in run["params"].items())
+    print(f"Run #{args.run_id}: {run['strategy']} v{run['version']} ({params}), {run['cost_bp']:.0f}bp, {run['period']}")
+    print(f"{len(trades)} trades written to {path}")
+    return 0
+
+
 def _fmt_px(value: float | None) -> str:
     return "-" if value is None else f"{value:,.2f}"
 
@@ -461,6 +623,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     d_stat = data_sub.add_parser("status", help="what is stored per symbol and how fresh it is (no API calls)")
     d_stat.set_defaults(func=_cmd_data_status)
+
+    bt = sub.add_parser("backtest", help="test strategies on stored daily bars")
+    bt_sub = bt.add_subparsers(dest="backtest_command", required=True)
+    from .strategies import REGISTRY
+
+    b_run = bt_sub.add_parser("run", help="run every parameter set at every cost level; results are saved")
+    b_run.add_argument("--strategy", choices=["all", *REGISTRY], default="all")
+    b_run.add_argument("--period", choices=["in-sample", "holdout"], default="in-sample",
+                       help="in-sample (default) tunes and compares; holdout is the final check on unseen data")
+    b_run.add_argument("--symbols", nargs="+", default=None, help="default: [watchlist] symbols in settings")
+    b_run.add_argument("--fill", choices=["open", "close", "both"], default="open",
+                       help="when orders fill: next day's open (default), same day's close, or both")
+    b_run.set_defaults(func=_cmd_backtest_run)
+
+    b_exp = bt_sub.add_parser("export", help="write a run's trades to a CSV file")
+    b_exp.add_argument("run_id", type=int)
+    b_exp.set_defaults(func=_cmd_backtest_export)
 
     return parser
 

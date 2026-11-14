@@ -45,6 +45,7 @@ class RefreshResult:
     market_open: bool
     written: dict[str, dict[str, int]] = field(default_factory=dict)  # timeframe -> symbol -> bars
     backfilled: dict[str, list[str]] = field(default_factory=dict)  # timeframe -> symbols seen for the first time
+    full_repull: list[str] = field(default_factory=list)  # timeframes re-pulled in full (dividend adjustment)
     snapshots: int = 0
     checked_session: date | None = None
     warnings: list[str] = field(default_factory=list)
@@ -64,6 +65,16 @@ def pull_window(now: datetime, days: int, feed: str) -> tuple[datetime, datetime
     today = now.astimezone(NEW_YORK).date()
     end = now - SIP_DELAY if feed == "sip" else now
     return ny_midnight_utc(today - timedelta(days=days)), end
+
+
+def feed_for(timeframe: str, settings: Settings) -> str:
+    """Daily bars come from [data] daily_feed; intraday bars and quotes from [data] feed."""
+    return settings.daily_feed if timeframe == "1Day" else settings.data_feed
+
+
+def adjustment_for(timeframe: str, settings: Settings) -> str:
+    """Daily bars use [data] daily_adjustment; intraday bars use [data] adjustment."""
+    return settings.daily_adjustment if timeframe == "1Day" else settings.data_adjustment
 
 
 def history_start(now: datetime, timeframe: str, settings: Settings) -> datetime:
@@ -109,24 +120,33 @@ def refresh(
     now = now or datetime.now(timezone.utc)
     symbols = tuple(symbols or settings.watchlist)
     feed = settings.data_feed
-    end = now - SIP_DELAY if feed == "sip" else now
 
     result = RefreshResult(market_open=bool(client.get_clock().get("is_open")))
 
     for tf in settings.refresh_timeframes:
+        tf_feed = feed_for(tf, settings)
+        tf_adj = adjustment_for(tf, settings)
+        end = now - SIP_DELAY if tf_feed == "sip" else now
         depth = history_start(now, tf, settings)
+        # Dividend-adjusted prices are re-scaled by every new dividend, so once per New York day
+        # re-pull the whole history instead of only new bars (about 3 requests for daily bars).
+        full_key = f"full_repull:{tf_feed}:{tf}:{tf_adj}"
+        today = now.astimezone(NEW_YORK).date().isoformat()
+        full_repull = tf_adj in ("dividend", "all") and storage.get_meta(conn, full_key) != today
         new: list[str] = []
         known: dict[str, datetime] = {}
         for s in symbols:
-            done = _backfill_record(conn, s, tf, feed)
+            done = _backfill_record(conn, s, tf, tf_feed)
             # Backfill once per symbol/timeframe/feed, even if a manual pull already stored some
-            # recent bars; again only if [history] was made deeper than the last backfill.
-            if done is None or depth < done[0]:
+            # recent bars; again if [history] was made deeper or the price adjustment changed.
+            if done is None or depth < done[0] or done[2] != tf_adj:
                 new.append(s)
+            elif full_repull:
+                known[s] = depth + OVERLAP.get(tf, DEFAULT_OVERLAP)  # whole history, see above
             else:
                 # Newest stored bar; for a symbol whose backfill returned nothing (bad ticker,
                 # no trades on this feed), the time of that backfill.
-                known[s] = storage.latest_bar_time(conn, s, tf, feed) or done[1]
+                known[s] = storage.latest_bar_time(conn, s, tf, tf_feed) or done[1]
 
         groups: list[tuple[datetime, list[str]]] = []
         if new:
@@ -141,10 +161,16 @@ def refresh(
         for start, group in groups:
             if start >= end:
                 continue
-            counts, _ = ingest(client, conn, group, tf, start, end, feed=feed, adjustment=settings.data_adjustment)
+            counts, _ = ingest(client, conn, group, tf, start, end, feed=tf_feed, adjustment=tf_adj)
             written.update(counts)
         for s in new:
-            storage.set_meta(conn, _backfill_key(s, tf, feed), f"{storage.format_ts(depth)}|{storage.format_ts(end)}")
+            storage.set_meta(
+                conn, _backfill_key(s, tf, tf_feed), f"{storage.format_ts(depth)}|{storage.format_ts(end)}|{tf_adj}"
+            )
+        if tf_adj in ("dividend", "all"):
+            storage.set_meta(conn, full_key, today)
+            if full_repull and not new:
+                result.full_repull.append(tf)
         result.written[tf] = written
 
     if result.market_open:
@@ -170,13 +196,14 @@ def _backfill_key(symbol: str, timeframe: str, feed: str) -> str:
 
 def _backfill_record(
     conn: sqlite3.Connection, symbol: str, timeframe: str, feed: str
-) -> tuple[datetime, datetime] | None:
-    """(oldest time backfilled from, time the backfill ran up to), or None if never backfilled."""
+) -> tuple[datetime, datetime, str] | None:
+    """(oldest time backfilled from, time it ran up to, price adjustment), or None if never.
+    Records written before adjustments were tracked were all "split"."""
     value = storage.get_meta(conn, _backfill_key(symbol, timeframe, feed))
     if not value:
         return None
-    start, _, end = value.partition("|")
-    return storage.parse_ts(start), storage.parse_ts(end)
+    start, end, *rest = value.split("|")
+    return storage.parse_ts(start), storage.parse_ts(end), (rest[0] if rest else "split")
 
 
 def _stale_warnings(

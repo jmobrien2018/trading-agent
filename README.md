@@ -77,6 +77,26 @@ by hand before a work session; it catches up everything since the last run.
 The task runs as you, only while you're logged on, with no console window. Outside market hours
 each run finds nothing new and exits in a second or two. Check on it with `trading-agent data status`.
 
+## Backtesting (Phase 3)
+
+Strategies follow the standard format in `src/trading_agent/strategy.py` (spec: the plan doc's
+"Strategy format spec" tab). Each lives in its own file under `src/trading_agent/strategies/`.
+
+```powershell
+trading-agent backtest run                               # every strategy, every parameter set, at 5 and 10 bp
+trading-agent backtest run --strategy trend_ma
+trading-agent backtest export 23                         # a run's trades to CSV (data folder\exports)
+trading-agent backtest run --strategy trend_ma --period holdout   # final check only; don't tune on it
+```
+
+- Daily bars come from the full-market (SIP) feed, adjusted for splits and dividends, back to 2016.
+- Settings live in `[backtest]` in `config/settings.toml`: $10,000 per strategy, costs at 5 and 10 bp per side,
+  and the hold-out year that starts on 2025-11-14.
+- Orders fill at the next open. Fractional shares are allowed, and each position is capped at `max_position_usd`.
+- Before running, each strategy is checked for look-ahead: its signals must not change when future bars are removed.
+- Every run and trade is saved to the database. Hold-out runs are counted, so it's visible how often the unseen
+  year has been used.
+
 ## Ad hoc pulls and reports (Phase 1)
 
 ```powershell
@@ -103,6 +123,10 @@ the full market (SIP).
 | `src/trading_agent/alpaca.py` | Paper-only Alpaca REST client: account, clock, calendar, bars, snapshots |
 | `src/trading_agent/pipeline.py` | Backfill, incremental refresh, snapshots, quality warnings, run lock |
 | `src/trading_agent/data_quality.py` | Coverage, gap and freshness checks for stored bars |
+| `src/trading_agent/strategy.py` | The standard strategy format: header, intents, exit and sizing menus, look-ahead check |
+| `src/trading_agent/indicators.py` | Moving average, RSI, ATR (all causal) |
+| `src/trading_agent/strategies/` | One file per strategy, plus the registry |
+| `src/trading_agent/backtest.py` | Daily backtest engine, metrics, buy-and-hold benchmark |
 | `src/trading_agent/logging_setup.py` | Console logs plus JSON-lines file in `logs/` |
 | `src/trading_agent/cli.py` | All `trading-agent` commands |
 | `scripts/schedule-refresh.ps1` | Registers or removes the scheduled refresh |

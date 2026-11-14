@@ -15,7 +15,7 @@ def test_local_override_merges(project_root):
     (project_root / "config" / "settings.local.toml").write_text("[risk]\nmax_daily_loss_usd = 50\n")
     s = load_settings(project_root)
     assert s.risk.max_daily_loss_usd == 50
-    assert s.risk.max_position_usd == 1000  # untouched keys survive the merge
+    assert s.risk.max_position_usd == 2000  # untouched keys survive the merge
 
 
 def test_live_mode_is_rejected(project_root):
@@ -42,11 +42,14 @@ def test_watchlist_and_data_defaults(project_root):
     [
         ('[broker]\npaper_base_url = "https://api.alpaca.markets"\n', "paper"),
         ('[data]\nfeed = "otc"\n', "feed"),
+        ('[data]\ndaily_feed = "otc"\n', "daily_feed"),
         ('[watchlist]\nsymbols = []\n', "non-empty"),
         ('[watchlist]\nsymbols = ["AAPL", "not a ticker"]\n', "Invalid symbol"),
         ('[refresh]\ntimeframes = ["1Week"]\n', "timeframes"),
         ('[refresh]\nmin_coverage = 95\n', "fraction"),
         ('[history]\nminute_days = 0\n', "minute_days"),
+        ('[backtest]\nposition_cap_pct = 150\n', "position_cap_pct"),
+        ('[backtest]\nholdout_start = "soon"\n', "holdout_start"),
     ],
 )
 def test_bad_broker_and_data_settings_rejected(project_root, override, match):

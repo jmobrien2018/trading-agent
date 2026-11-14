@@ -69,6 +69,10 @@ def test_first_refresh_backfills_history(fake, conn, settings):
     # Backfill starts at New York midnight, [history] days back.
     assert fake.bar_requests("1Min")[0]["start"] == "2026-11-10T05:00:00Z"
     assert fake.bar_requests("1Day")[0]["start"] == "2025-11-13T05:00:00Z"
+    # Daily bars come from the full-market feed, 16 minutes behind; minute bars stay on IEX.
+    assert fake.bar_requests("1Day")[0]["feed"] == "sip"
+    assert fake.bar_requests("1Day")[0]["end"] == "2026-11-13T18:44:00Z"
+    assert fake.bar_requests("1Min")[0]["feed"] == "iex"
 
     assert result.snapshots == 2
     assert result.checked_session == date(2026, 11, 12)
@@ -146,6 +150,32 @@ def test_deeper_history_setting_triggers_another_backfill(fake, conn, settings, 
         result = pipeline.refresh(c, conn, deeper, now=NOW + timedelta(minutes=5))
     assert result.backfilled == {"1Min": ["SPY", "AAPL"]}
     assert fake.bar_requests("1Min")[0]["start"] == "2026-10-14T04:00:00Z"  # 30 days back, EDT midnight
+
+
+def test_dividend_adjusted_daily_bars_repull_full_history_once_a_day(fake, conn, settings):
+    assert settings.daily_adjustment == "all"
+    with client(fake) as c:
+        pipeline.refresh(c, conn, settings, now=NOW)
+        assert fake.bar_requests("1Day")[0]["adjustment"] == "all"
+        assert fake.bar_requests("1Min")[0]["adjustment"] == "split"
+        fake.requests.clear()
+        same_day = pipeline.refresh(c, conn, settings, now=NOW + timedelta(minutes=5))
+        fake.requests.clear()
+        next_day = pipeline.refresh(c, conn, settings, now=NOW + timedelta(days=1))
+    assert same_day.full_repull == []
+    assert next_day.full_repull == ["1Day"]
+    assert fake.bar_requests("1Day")[0]["start"] == "2025-11-14T05:00:00Z"  # whole history again
+
+
+def test_changing_adjustment_triggers_backfill(fake, conn, settings, project_root):
+    with client(fake) as c:
+        pipeline.refresh(c, conn, settings, now=NOW)
+        (project_root / "config" / "settings.local.toml").write_text(
+            '[watchlist]\nsymbols = ["SPY", "AAPL"]\n[history]\nminute_days = 3\ndaily_years = 1\n'
+            '[data]\ndaily_adjustment = "split"\n'
+        )
+        result = pipeline.refresh(c, conn, load_settings(project_root), now=NOW + timedelta(minutes=5))
+    assert result.backfilled == {"1Day": ["SPY", "AAPL"]}
 
 
 def test_market_closed_skips_snapshots_and_staleness(fake, conn, settings):

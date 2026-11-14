@@ -52,6 +52,23 @@ def test_bars_upsert_is_idempotent_and_queryable(conn):
     assert storage.stored_feeds(conn, "1Min") == ["iex", "sip"]
 
 
+def test_old_database_gains_fill_column(tmp_path):
+    db = tmp_path / "old.sqlite3"
+    old = sqlite3.connect(db)
+    old.execute("CREATE TABLE backtest_runs (id INTEGER PRIMARY KEY, created_utc TEXT NOT NULL, batch TEXT NOT NULL, "
+                "strategy TEXT NOT NULL, version INTEGER NOT NULL, params TEXT NOT NULL, cost_bp REAL NOT NULL, "
+                "period TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, capital REAL NOT NULL, "
+                "symbols TEXT NOT NULL, metrics TEXT NOT NULL)")
+    old.execute("INSERT INTO backtest_runs VALUES (1, 't', 'b', 's', 1, '{}', 5, 'in-sample', 'a', 'b', 1, '[]', '{}')")
+    old.commit()
+    old.close()
+    conn = storage.connect(db)
+    try:
+        assert conn.execute("SELECT fill FROM backtest_runs WHERE id = 1").fetchone()[0] == "open"
+    finally:
+        conn.close()
+
+
 def test_reconnect_keeps_schema_and_data(tmp_path):
     db = tmp_path / "db.sqlite3"
     c1 = storage.connect(db)
